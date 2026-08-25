@@ -6,6 +6,8 @@
 //
 // Axis convention (see geo.js): +x east, +y up, +z south.
 
+import { chamferFrom, sampleField, stampPolyline } from './field.js';
+
 const KINDS = ['residential', 'commercial', 'industrial', 'civic', 'minor', 'other'];
 
 export class World {
@@ -114,65 +116,17 @@ export class World {
    * road access is a real city-builder constraint, and this is how we ask.
    */
   _buildRoadDistance() {
-    const c = this.cols, r = this.rows, cell = this.cell;
-    const BIG = 1e6;
-    const d = new Float32Array(c * r).fill(BIG);
-
-    const mark = (x, z) => {
-      const i = Math.round((x - this.x0) / cell);
-      const j = Math.round((z - this.z0) / cell);
-      if (i >= 0 && i < c && j >= 0 && j < r) d[j * c + i] = 0;
-    };
-
-    // Rasterise each road, stepping along segments at ~half a cell so we never
-    // leave gaps on a diagonal.
+    const d = new Float32Array(this.cols * this.rows).fill(1e6);
     for (const road of this.roads) {
       if (road.k === 'foot') continue;          // footpaths are not vehicle access
-      const p = road.pts;
-      for (let i = 0; i < p.length - 2; i += 2) {
-        const ax = p[i], az = p[i + 1], bx = p[i + 2], bz = p[i + 3];
-        const len = Math.hypot(bx - ax, bz - az);
-        const steps = Math.max(1, Math.ceil(len / (cell * 0.5)));
-        for (let s = 0; s <= steps; s++) {
-          const t = s / steps;
-          mark(ax + (bx - ax) * t, az + (bz - az) * t);
-        }
-      }
+      stampPolyline(d, this.cols, this.rows, this.cell, this.x0, this.z0, road.pts);
     }
-
-    // Chamfer 3×3: orthogonal 1.0, diagonal √2, scaled to metres.
-    const O = cell, D = cell * Math.SQRT2;
-    for (let j = 0; j < r; j++) for (let i = 0; i < c; i++) {
-      const k = j * c + i;
-      let v = d[k];
-      if (i > 0) v = Math.min(v, d[k - 1] + O);
-      if (j > 0) v = Math.min(v, d[k - c] + O);
-      if (i > 0 && j > 0) v = Math.min(v, d[k - c - 1] + D);
-      if (i < c - 1 && j > 0) v = Math.min(v, d[k - c + 1] + D);
-      d[k] = v;
-    }
-    for (let j = r - 1; j >= 0; j--) for (let i = c - 1; i >= 0; i--) {
-      const k = j * c + i;
-      let v = d[k];
-      if (i < c - 1) v = Math.min(v, d[k + 1] + O);
-      if (j < r - 1) v = Math.min(v, d[k + c] + O);
-      if (i < c - 1 && j < r - 1) v = Math.min(v, d[k + c + 1] + D);
-      if (i > 0 && j < r - 1) v = Math.min(v, d[k + c - 1] + D);
-      d[k] = v;
-    }
-    this.roadDist = d;
+    this.roadDist = chamferFrom(d, this.cols, this.rows, this.cell);
   }
 
   /** Metres to the nearest drivable road. Bilinear over the chamfer grid. */
   roadDistAt(x, z) {
-    const { fi, fj } = this._grid(x, z);
-    const i = Math.max(0, Math.min(this.cols - 2, Math.floor(fi)));
-    const j = Math.max(0, Math.min(this.rows - 2, Math.floor(fj)));
-    const dx = Math.max(0, Math.min(1, fi - i));
-    const dz = Math.max(0, Math.min(1, fj - j));
-    const d = this.roadDist, c = this.cols;
-    return d[j * c + i] * (1 - dx) * (1 - dz) + d[j * c + i + 1] * dx * (1 - dz)
-         + d[(j + 1) * c + i] * (1 - dx) * dz + d[(j + 1) * c + i + 1] * dx * dz;
+    return sampleField(this.roadDist, this.cols, this.rows, this.cell, this.x0, this.z0, x, z);
   }
 
   // ─── buildings ────────────────────────────────────────────────────────────
