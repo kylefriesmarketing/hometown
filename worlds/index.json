@@ -1,0 +1,16 @@
+[
+  {
+    "name": "myrtle-beach",
+    "label": "Myrtle Beach, Horry County, South Carolina",
+    "buildings": 758,
+    "km2": 4.84,
+    "relief": 13.1
+  },
+  {
+    "name": "russian-hill",
+    "label": "Russian Hill, San Francisco",
+    "buildings": 5857,
+    "km2": 3.24,
+    "relief": 121.2
+  }
+]

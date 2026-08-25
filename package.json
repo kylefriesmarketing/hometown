@@ -1,0 +1,12 @@
+{
+  "name": "hometown",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A city builder played on real places — OpenStreetMap geometry over free elevation data.",
+  "scripts": {
+    "bake": "node tools/bake.mjs",
+    "test": "node test-sim.mjs",
+    "serve": "node serve.mjs"
+  }
+}
