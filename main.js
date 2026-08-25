@@ -3,12 +3,15 @@
 import { World } from './world.js';
 import { View } from './view.js';
 import { UI } from './ui.js';
+import { RoadGraph } from './graph.js';
+import { Sim } from './sim.js';
+import { Game } from './game.js';
 
 const canvas = document.getElementById('c');
 const bootEl = document.getElementById('boot');
 const bootMsg = document.getElementById('boot-msg');
 
-let world = null, view = null, ui = null;
+let world = null, view = null, ui = null, graph = null, sim = null, game = null;
 const keys = Object.create(null);
 
 // ─── boot ─────────────────────────────────────────────────────────────────
@@ -47,8 +50,14 @@ async function loadWorld(name) {
   ui.setWorld(world);
   syncOptions();
 
+  // the play layer
+  graph = new RoadGraph(world);
+  sim = new Sim(world, graph, { seed: 20260825 });
+  game = new Game(sim, view, ui);
+  console.log('[hometown] street graph', graph.stats());
+
   bootEl.classList.add('gone');
-  window.__ht = { world, view, ui };    // console handle for verification
+  window.__ht = { world, view, ui, graph, sim, game };   // console handle for verification
 }
 
 /** Where the buildings actually are — a better opening shot than (0,0). */
@@ -78,11 +87,22 @@ let drag = null;
 
 canvas.addEventListener('pointerdown', e => {
   canvas.setPointerCapture(e.pointerId);
-  drag = { x: e.clientX, y: e.clientY, button: e.button };
+  drag = { x: e.clientX, y: e.clientY, button: e.button, x0: e.clientX, y0: e.clientY, moved: 0 };
   canvas.classList.add('dragging');
 });
 
 canvas.addEventListener('pointerup', e => {
+  // A click selects; a drag pans. Distinguish by how far the pointer travelled,
+  // so a small wobble while clicking does not silently become a camera move.
+  if (drag && drag.button === 0 && drag.moved < 5 && game && view) {
+    const r = canvas.getBoundingClientRect();
+    const nx = ((e.clientX - r.left) / r.width) * 2 - 1;
+    const ny = -((e.clientY - r.top) / r.height) * 2 + 1;
+    try {
+      const hit = view.pick(nx, ny);
+      game.select(hit && hit.building ? hit.index : -1, e.shiftKey);
+    } catch (err) { console.warn('pick failed', err); }
+  }
   drag = null;
   canvas.classList.remove('dragging');
 });
@@ -93,6 +113,7 @@ canvas.addEventListener('pointermove', e => {
   if (drag) {
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
     drag.x = e.clientX; drag.y = e.clientY;
+    drag.moved += Math.abs(dx) + Math.abs(dy);
     const c = view.cam;
 
     if (drag.button === 2 || e.shiftKey) {
@@ -133,6 +154,10 @@ canvas.addEventListener('wheel', e => {
 addEventListener('keydown', e => {
   keys[e.key.toLowerCase()] = true;
   if (e.key === 'Tab') e.preventDefault();
+  if (!game) return;
+  if (e.key === 'Escape') game.clearSelection();
+  if (e.key === ' ') { e.preventDefault(); game.setSpeed(game.speed === 0 ? 1 : 0); }
+  if (e.key >= '1' && e.key <= '4') game.setSpeed(+e.key - 1);
 });
 addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 addEventListener('resize', () => view?.resize());
@@ -189,6 +214,7 @@ function loop(now) {
   last = now;
   if (!view) return;
   pollKeys(dt);
+  if (game) game.update(dt);
   view.render();
 }
 

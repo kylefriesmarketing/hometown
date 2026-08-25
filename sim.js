@@ -518,20 +518,44 @@ export class Sim {
 
   // ── save / load / hash ───────────────────────────────────────────────────
 
+  /**
+   * ⚠️⚠️ A SAVE IS LOSSLESS. Do not "tidy" these arrays by rounding them.
+   *
+   * They were quantised to 3 decimals once. The round-trip test PASSED, because
+   * stateHash() quantises to 3 decimals too — so both sides rounded to the same
+   * number while the underlying floats differed by up to 5e-4. The city is a
+   * feedback loop (occupancy -> traffic -> travel time -> desirability ->
+   * occupancy), so it amplified that error past the rounding boundary within a
+   * single tick and the two saves diverged. Values are Float32Array elements, so
+   * writing them at full precision round-trips exactly.
+   */
   snapshot() {
     return {
-      v: 1,
+      v: 2,
       seed: this.seed, rng: this.rng,
       day: this.day, money: this.money, bankrupt: this.bankrupt,
       zone: Array.from(this.zone),
-      occ: Array.from(this.occ, v => Math.round(v * 1000) / 1000),
+      occ: Array.from(this.occ),
       bCursor: this._bCursor, zCursor: this._zCursor,
+      // ⚠️⚠️ ROUND-ROBIN UPDATES TURN "DERIVED" VALUES INTO STATE, and all three
+      // of these caught us out. Traffic `load` accumulates across a whole sweep;
+      // `desire` and `zoneAccess` are refreshed a SLICE at a time, so what is
+      // stored is a mosaic of many different ticks, not a snapshot of one.
+      // Recomputing them in a single pass at restore therefore produces a
+      // DIFFERENT city — one that hashes identically at the moment of the save
+      // and drifts apart tens of ticks later. That is the worst failure mode
+      // available: a harness that reports "in sync" while the cities diverge.
+      // If you add another sliced update, it belongs here too.
+      load: Array.from(this.graph.load),
+      nextLoad: Array.from(this._nextLoad),
+      desire: Array.from(this.desire),
+      zoneAccess: Array.from(this.zoneAccess),
       history: this.history.slice(),
     };
   }
 
   restore(s) {
-    if (!s || s.v !== 1) throw new Error('unsupported save version');
+    if (!s || s.v !== 2) throw new Error('unsupported save version');
     this.seed = s.seed >>> 0;
     this.rng = s.rng >>> 0;
     this.day = s.day;
@@ -543,21 +567,31 @@ export class Sim {
     this._zCursor = s.zCursor | 0;
     this.history = (s.history || []).slice();
 
-    // Everything else is DERIVED and must be rebuilt, never trusted from a save.
+    // Sliced/accumulated values are restored VERBATIM — see snapshot().
+    this.graph.load.set(s.load);
+    this._nextLoad.set(s.nextLoad);
+    this.desire.set(s.desire);
+    this.zoneAccess.set(s.zoneAccess);
+
+    // Only genuinely pure values are rebuilt: capacity follows from zoning,
+    // nuisance from where industry now is, totals from occupancy.
     for (let i = 0; i < this.n; i++) this.cap[i] = this._capacityOf(i, this.zone[i]);
     this._rebuildNuisance();
-    this._recomputeTotals();
-    this._fullTrafficPass();
-    for (let i = 0; i < this.n; i++) this._updateDesire(i);
+    this._aggregateZones();
     this._recomputeTotals();
     return this;
   }
 
   /**
    * Fold every piece of AUTHORITATIVE state into one number.
-   * ⚠️ Derived values (desire, access, traffic) are deliberately NOT folded —
-   * they are rebuilt identically from the state that IS folded. Anything that
-   * a player action can change and that is not recomputable belongs here.
+   *
+   * ⚠️ "Authoritative" means anything that changes how the city evolves from
+   * here and is NOT a pure function of what is already folded. Desirability and
+   * accessibility are genuinely derived and are left out on purpose. Traffic
+   * `load` is NOT — it accumulates across ticks, so it is folded. Leaving it out
+   * made the hash agree at the moment of a save and diverge 40 ticks later,
+   * which is the worst possible failure mode: a harness that says "in sync"
+   * while the two cities quietly drift apart.
    */
   stateHash() {
     let h = 2166136261 >>> 0;
@@ -569,6 +603,12 @@ export class Sim {
     for (let i = 0; i < this.n; i++) {
       mix(this.zone[i] * 31 + 7);
       mix(Math.round(this.occ[i] * 1000));
+    }
+    for (let i = 0; i < this.n; i++) mix(Math.round(this.desire[i] * 1000));
+    for (let z = 0; z < this.nZones; z++) mix(Math.round(this.zoneAccess[z] * 1000));
+    for (let e = 0; e < this.graph.edgeCount; e++) {
+      mix(Math.round(this.graph.load[e] * 1000));
+      mix(Math.round(this._nextLoad[e] * 1000));
     }
     return h | 0;
   }

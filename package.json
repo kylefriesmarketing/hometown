@@ -6,7 +6,9 @@
   "description": "A city builder played on real places — OpenStreetMap geometry over free elevation data.",
   "scripts": {
     "bake": "node tools/bake.mjs",
-    "test": "node test-sim.mjs",
-    "serve": "node serve.mjs"
+    "test": "node test.mjs && node test-sim.mjs",
+    "serve": "node serve.mjs",
+    "test:map": "node test.mjs",
+    "test:sim": "node test-sim.mjs"
   }
 }

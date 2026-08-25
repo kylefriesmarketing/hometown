@@ -506,13 +506,18 @@ export class View {
       if (overlay === 'none' || !data) {
         wall = wallColour(i, b.kind, b.h);
         roof = roofColour(i);
+      } else if (data.colourAt) {
+        // categorical overlay (zoning): fixed colour per class
+        const hex = data.colourAt(i);
+        if (hex === null) { wall = 0x8f8a83; roof = 0x76716b; }
+        else { wall = hex; roof = tmp.setHex(hex).multiplyScalar(0.76).getHex(); }
       } else {
         const v = data.valueAt(i);           // 0..1, or null to grey out
-        if (v === null) { wall = 0x9a948c; roof = 0x7d7871; }
+        if (v === null) { wall = 0x8f8a83; roof = 0x76716b; }
         else {
-          tmp.setHSL(data.hueFor(v), 0.62, 0.28 + 0.34 * v);
+          tmp.setHSL(data.hueFor(v), 0.62, 0.30 + 0.32 * v);
           wall = tmp.getHex();
-          roof = tmp.clone().multiplyScalar(0.78).getHex();
+          roof = tmp.multiplyScalar(0.78).getHex();
         }
       }
 
