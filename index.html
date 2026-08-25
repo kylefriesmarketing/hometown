@@ -108,7 +108,10 @@
   #tools button:disabled { opacity: .4; cursor: default; }
   #tools .hintline { font-size: 11px; color: var(--dim); margin-top: 3px; }
 
-  #sel-info, #sea-info { font-size: 11.5px; color: var(--dim); min-height: 15px; }
+  #sel-info, #sea-info, #road-info { font-size: 11.5px; color: var(--dim); min-height: 15px; }
+  #road-info b { color: var(--text); }
+  #tools button.danger { border-color: rgba(255,155,155,.45); color: #ffc9c9; }
+  #tools button.wide { grid-column: span 2; }
   #sea-info b { color: var(--warn); }
   #sea-slider { width: 190px; accent-color: var(--accent); cursor: pointer; }
   #sea-value { font-variant-numeric: tabular-nums; font-weight: 650; min-width: 52px; display: inline-block; }
@@ -174,7 +177,7 @@
     <div class="metric"><div class="v" id="m-unemp">—</div><div class="k">unemployed</div></div>
     <div class="metric"><div class="v" id="m-traffic">—</div><div class="k">congested</div></div>
     <div class="sep"></div>
-    <div class="metric"><div class="v" id="m-money">—</div><div class="k">treasury</div></div>
+    <div class="metric"><div class="v" id="m-commute">—</div><div class="k">commute</div></div>
     <div class="sep"></div>
     <div id="speeds"></div>
   </div>
@@ -194,6 +197,11 @@
       </div>
       <div id="sea-info">drag to raise the sea</div>
       <div class="hintline" id="sea-note">~1 m is a century of real rise · beyond that is a what-if</div>
+    </div>
+    <div class="group">
+      <div class="glabel">Streets</div>
+      <div class="row" id="road-row"></div>
+      <div id="road-info">click a street to select it · shift-click to add</div>
     </div>
     <div class="group">
       <div class="glabel">Rezone selected</div>

@@ -58,7 +58,8 @@ export class Game {
     this.ui = ui;
     this.speed = 1;
     this.accum = 0;
-    this.selection = new Set();
+    this.selection = new Set();      // building indices
+    this.roadSel = new Set();        // world.roads indices
     this.overlay = 'none';
     this._hudT = 0;
 
@@ -66,7 +67,9 @@ export class Game {
     this._buildSeaSlider();
     this._buildOverlays();
     this._buildZoneButtons();
+    this._buildRoadButtons();
     this.refreshHud();
+    this.refreshRoads();
     this.applyOverlay('none');
   }
 
@@ -124,6 +127,7 @@ export class Game {
       ? 'drag to raise the sea'
       : `<b>${fmt(f.buildings)}</b> buildings under water · <b>${fmt(f.displaced)}</b> people displaced · <b>${f.roads}</b> streets cut`;
     this.refreshHud();
+    this.refreshRoads();
     this.repaintOverlay(true);
     void cells;
   }
@@ -146,9 +150,16 @@ export class Game {
     tr.textContent = (s.congested * 100).toFixed(0) + '%';
     tr.className = 'v' + (s.congested > 0.25 ? ' bad' : '');
 
-    const mo = $('m-money');
-    mo.textContent = money(sim.money);
-    mo.className = 'v' + (sim.money < 0 ? ' bad' : '');
+    // ⚠️ The treasury used to live here and it was noise: in a sandbox with no
+    // fail state it only ever climbs, so it told the player nothing. The mean
+    // commute is the number that actually responds to what they do to the city.
+    const cm = $('m-commute');
+    const mins = sim.stats.commute;
+    cm.textContent = mins > 0 ? mins.toFixed(1) + ' min' : '—';
+    cm.className = 'v' + (mins > 32 ? ' bad' : mins > 0 && mins < 18 ? ' good' : '');
+    cm.title = sim.stats.stranded > 0
+      ? `${fmt(sim.stats.stranded)} people cannot reach any work by road`
+      : 'population-weighted mean travel time to work';
   }
 
   // ── overlays ─────────────────────────────────────────────────────────────
@@ -204,6 +215,79 @@ export class Game {
     });
   }
 
+
+  // ── streets ──────────────────────────────────────────────────────────────
+
+  _buildRoadButtons() {
+    const row = $('road-row');
+    if (!row) return;
+    row.innerHTML = '';
+    const add = (label, title, fn, cls) => {
+      const b = document.createElement('button');
+      b.textContent = label; b.title = title;
+      if (cls) b.className = cls;
+      b.addEventListener('click', fn);
+      row.appendChild(b);
+    };
+    add('Close', 'Shut this street to traffic — it stays on the map', () => this.roadOp('close'));
+    add('Reopen', 'Let traffic back on', () => this.roadOp('open'));
+    add('Widen', 'More lanes, more capacity', () => this.roadOp('widen'));
+    add('Narrow', 'Fewer lanes', () => this.roadOp('narrow'));
+    add('Tear out', 'Remove the street entirely', () => this.roadOp('remove'), 'danger');
+    // The what-if this whole sandbox exists for.
+    add('⚑ Select every freeway', 'Select all motorways and trunk roads — then tear them out',
+        () => this.selectFreeways(), 'wide');
+  }
+
+  selectRoad(index, additive) {
+    if (index == null || index < 0) { if (!additive) this.clearRoadSelection(); return; }
+    if (!additive) this.roadSel.clear();
+    if (this.roadSel.has(index)) this.roadSel.delete(index);
+    else this.roadSel.add(index);
+    this.refreshRoads();
+  }
+
+  clearRoadSelection() { this.roadSel.clear(); this.refreshRoads(); }
+
+  /** Every motorway and trunk road on the map — the freeway what-if in one click. */
+  selectFreeways() {
+    this.roadSel.clear();
+    for (const i of this.sim.roadsOfKind('highway')) this.roadSel.add(i);
+    this.selection.clear();
+    this.refreshSelection();
+    this.refreshRoads();
+    this.toast(this.roadSel.size
+      ? `${this.roadSel.size} freeway segments selected — now tear them out`
+      : 'no freeways on this map', !this.roadSel.size);
+  }
+
+  roadOp(op) {
+    if (!this.roadSel.size) return this.toast('Select a street first', true);
+    const r = this.sim.execCommand({ t: 'road', ids: [...this.roadSel], op });
+    if (!r.ok) return this.toast(r.reason, true);
+    const verb = { close: 'closed', open: 'reopened', widen: 'widened',
+                   narrow: 'narrowed', remove: 'torn out' }[op] || op;
+    this.toast(`${r.count} street${r.count === 1 ? '' : 's'} ${verb}`);
+    this.refreshHud();
+    this.refreshRoads();
+    this.repaintOverlay(true);
+  }
+
+  refreshRoads() {
+    this.view.paintRoads(this.sim.roadState, this.sim.roadLanes, this.roadSel);
+    const info = $('road-info');
+    if (!info) return;
+    const n = this.roadSel.size;
+    const s = this.sim.stats;
+    const state = [];
+    if (s.roadsClosed) state.push(`${s.roadsClosed} closed`);
+    if (s.roadsTorn) state.push(`${s.roadsTorn} torn out`);
+    const suffix = state.length ? ` · ${state.join(', ')} citywide` : '';
+    info.innerHTML = n
+      ? `<b>${n}</b> street${n === 1 ? '' : 's'} selected${suffix}`
+      : `click a street to select it · shift-click to add${suffix}`;
+  }
+
   // ── selection & commands ─────────────────────────────────────────────────
 
   _buildZoneButtons() {
@@ -226,13 +310,16 @@ export class Game {
 
   select(index, additive) {
     if (index == null || index < 0) { if (!additive) this.clearSelection(); return; }
-    if (!additive) this.selection.clear();
+    if (!additive) { this.selection.clear(); this.roadSel.clear(); this.refreshRoads(); }
     if (this.selection.has(index)) this.selection.delete(index);
     else this.selection.add(index);
     this.refreshSelection();
   }
 
-  clearSelection() { this.selection.clear(); this.refreshSelection(); }
+  clearSelection() {
+    this.selection.clear(); this.roadSel.clear();
+    this.refreshSelection(); this.refreshRoads();
+  }
 
   refreshSelection() {
     const n = this.selection.size;

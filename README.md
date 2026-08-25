@@ -14,43 +14,54 @@ Two free, key-less data sources — no Google, no API key, no per-request bill:
 
 ---
 
-## Status — M2: it is a playable what-if sandbox (2026-08-25)
+## Status — M3: street surgery (2026-08-25)
 
-**M1 (the map) and M2 (the simulation) are both done and verified.**
-`node test.mjs && node test-sim.mjs` = **150 tests, all green**.
+**M1 (map), M2 (sim) and M3 (streets) are done and verified.**
+`node test.mjs && node test-sim.mjs` = **172 tests, all green**.
 
-The design is a **what-if sandbox**: no fail state, no score. You inherit a real
-town and you break it — flood it, rezone it, tear things out — and watch the
-place react. San Francisco is the flagship.
+A **what-if sandbox**: no fail state, no score. You inherit a real town and you
+break it — flood it, rezone it, close streets, tear out the freeway — and watch
+the place react.
 
 What works:
 - bake any place on Earth into a playable world
-- a deterministic city sim on the REAL street graph and REAL terrain: capacity
-  from actual floor area, desirability from actual grade, road access, job
-  reach, parks, services and industrial nuisance
-- gravity commuting with BPR congestion over a routable OSM street network
-- **sea level**: raise it and watch which real streets go under. Buildings drown,
-  people are displaced, and flooded street segments are CUT from the network so
-  traffic genuinely reroutes around the water
-- five overlays (zoning, occupancy, desirability, job access, congestion)
-- click to select, rezone, demolish; speed controls; a live HUD
+- a deterministic sim on the REAL street graph and REAL terrain
+- **sea level**: raise it and real streets go under. Flooded segments are CUT
+  from the routing graph, so traffic reroutes around the water
+- **street surgery**: click any street to close, reopen, widen, narrow or tear
+  it out. One button selects every motorway and trunk road on the map
+- five overlays, click-to-rezone, demolish, speed controls, live HUD
 
-⚠️ **There is no pressure yet, by design and by omission.** Measured over one
-simulated year of San Francisco: population 62k → 88k, treasury $25k → $1.96M,
-unemployment 0.0%, congestion 1%. The city fixes itself and prints money. That is
-fine for a sandbox and fatal for a game with goals — if this ever grows a
-scenario mode, money must be able to run out and people must be able to leave.
+**Measured on San Francisco** (476k people, 470 km of streets, 291 freeway
+segments including the real Central and James Lick Freeways):
 
-Still to build from the chosen direction: **roads & transit** (draw, widen,
-pedestrianise, run a line — the graph already supports it), **services**
-(coverage fields already exist, mostly UI), and the **before/after slider +
-share link**.
+| | commute | population | stranded |
+|---|---|---|---|
+| as it really is | 3.5 min | 476,252 | 391 |
+| **every freeway torn out** | 3.6 min | 471,964 | **14,509** |
+
+"Stranded" is people who can no longer reach any work by road — it is the number
+that actually moves, and it moves 37x.
+
+⚠️ **Commutes read low (3–4 min) and that is honest, not broken.** The flagship
+is a 4.4 km square. Real commutes are long because they cross a metro area; trips
+that leave the map cannot be modelled, so what you are seeing is genuinely the
+travel time *within this slice of the city*.
+
+⚠️ **There is no pressure, deliberately.** The treasury was removed from the HUD
+because in a sandbox with no fail state it only ever climbed and told the player
+nothing. Mean commute replaced it.
+
+Still unbuilt from the chosen direction: **transit lines**, **services**
+(coverage fields already exist, mostly UI), **drawing new streets**, and the
+**before/after slider + share link**.
 
 Baked worlds:
 
 | world | area | buildings | relief | note |
 |---|---|---|---|---|
-| `russian-hill` | 3.2 km² | 5,857 | 121 m | flagship. Dense SF; 70% of heights are real OSM data |
+| `san-francisco` ★ | 19 km² | 17,636 | 144 m | **flagship.** Downtown, SoMa, the freeways, the Bay |
+| `russian-hill` | 3.2 km² | 5,857 | 121 m | small, dense; loads fast |
 | `myrtle-beach` | 4.8 km² | 758 | 13 m | flat coastal sprawl; the best flood demo |
 
 ---
@@ -74,6 +85,9 @@ node test.mjs && node test-sim.mjs
 ```bash
 node tools/bake.mjs --place "Asheville, North Carolina" --radius 1200 --name asheville
 ```
+
+For a big flagship-sized bake, `--minArea 40` sheds sheds and garages — the
+San Francisco world is 17,636 buildings and 8.8 MB raw / **2.1 MB gzipped**.
 
 Also accepts `--center 37.8005,-122.4130 --radius 900` or an explicit
 `--bbox s,w,n,e`. Options: `--zoom` (terrain tile zoom, default 14) and `--cell`
@@ -172,7 +186,24 @@ Strict separation, so the sim can arrive without touching the renderer:
     cannot reach, and `<=` drowns an entire town whose terrain sits flat at 0 m
     the moment sea level is 0 — which is the default.
 
-11. **Reload between destructive probes.** A probe that swaps a material and
+11. **Two block sources must stay independent.** A flooded street and a
+    player-closed street are different facts: draining the sea must not reopen a
+    street the player shut, and reopening a street must not un-flood the map.
+    `graph.blockedFlood` and `graph.blockedPlayer` are ORed into `_shut`.
+
+12. **Zone count must scale with the map, not the metre.** At a fixed 200 m grid
+    a 4.4 km city needs 484 traffic zones, and every zone is a Dijkstra over a
+    7,000-node graph — a tick cost 20 ms and the fast-forward speeds became
+    unreachable. Target a constant zone COUNT (`TARGET_ZONES`) plus a hard
+    `maxRoutesPerTick` ceiling. 3.2x faster, same behaviour.
+
+13. **Benchmark WARM, and force a GPU sync.** `renderer.render()` only queues
+    work, so timing it measures nothing; `readPixels` stalls until the GPU is
+    done. A cold first measurement made the shadow pass look like 4.1 ms of a
+    5.1 ms frame when warm it is 1.15 → 0.86 ms. Real cost at 1920x1080 while
+    panning is **1 ms/frame**, 2M triangles, 17 draw calls.
+
+14. **Reload between destructive probes.** A probe that swaps a material and
    leaves it swapped means the next measurement is measuring the probe.
 
 ---

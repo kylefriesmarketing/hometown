@@ -364,6 +364,146 @@ function gridTown({ span = 4, block = 100, pad = 0 } = {}) {
   ok('a flooded city round-trips', sim2.stateHash() === sim.stateHash());
 }
 
+
+// ── street surgery ─────────────────────────────────────────────────────────
+{
+  const w = gridTown();
+  const sim = new Sim(w, new RoadGraph(w), { seed: 12 });
+  for (let i = 0; i < 120; i++) sim.tick();
+
+  const g = sim.graph;
+  ok('every edge maps to a real world road',
+     Array.from(g.eroad).every(r => r >= 0 && r < w.roads.length));
+  ok('edge road indices point at DRIVABLE roads',
+     Array.from(g.eroad).every(r => w.roads[r].k !== 'foot'));
+
+  const before = sim.stateHash();
+  const target = g.eroad[0];
+
+  // close
+  const rc = sim.execCommand({ t: 'road', ids: [target], op: 'close' });
+  ok('closing a street reports a change', rc.ok && rc.count === 1, JSON.stringify(rc));
+  ok('closing changes the hash', sim.stateHash() !== before);
+  let anyBlocked = false;
+  for (let e = 0; e < g.edgeCount; e++) if (g.eroad[e] === target && g.blockedPlayer[e]) anyBlocked = true;
+  ok('closing blocks its graph edges', anyBlocked);
+
+  // routing must not use it
+  const usesClosed = () => {
+    for (let n = 0; n < g.nodeCount; n += 7) {
+      g.dijkstra(n);
+      for (let e = 0; e < g.edgeCount; e++) {
+        if (!g._shut[e]) continue;
+        if (g._prevEdge[g.eb[e]] === e || g._prevEdge[g.ea[e]] === e) return true;
+      }
+    }
+    return false;
+  };
+  ok('routing never uses a closed street', !usesClosed());
+
+  // reopen
+  sim.execCommand({ t: 'road', ids: [target], op: 'open' });
+  let stillBlocked = false;
+  for (let e = 0; e < g.edgeCount; e++) if (g.eroad[e] === target && g.blockedPlayer[e]) stillBlocked = true;
+  ok('reopening unblocks it', !stillBlocked);
+
+  // widen / narrow move capacity
+  const capBefore = g.capacityOf(0);
+  sim.execCommand({ t: 'road', ids: [g.eroad[0]], op: 'widen' });
+  ok('widening raises capacity', g.capacityOf(0) > capBefore,
+     `${capBefore.toFixed(0)} -> ${g.capacityOf(0).toFixed(0)}`);
+  sim.execCommand({ t: 'road', ids: [g.eroad[0]], op: 'narrow' });
+  sim.execCommand({ t: 'road', ids: [g.eroad[0]], op: 'narrow' });
+  ok('narrowing lowers capacity', g.capacityOf(0) < capBefore,
+     `${capBefore.toFixed(0)} -> ${g.capacityOf(0).toFixed(0)}`);
+
+  ok('an unknown road op is rejected',
+     sim.execCommand({ t: 'road', ids: [0], op: 'teleport' }).ok === false);
+  ok('an empty street selection is rejected',
+     sim.execCommand({ t: 'road', ids: [], op: 'close' }).ok === false);
+}
+
+// ⚠️ THE TWO BLOCK SOURCES MUST STAY INDEPENDENT. The sea receding must not
+// reopen a street the player closed, and reopening a street must not un-flood it.
+{
+  const w = gridTown();
+  const hh = new Float32Array(w.cols * w.rows);
+  for (let j = 0; j < w.rows; j++) {
+    for (let i = 0; i < w.cols; i++) hh[j * w.cols + i] = (i - w.cols / 2) * 0.6;
+  }
+  w.heights = hh; w.minH = hh[0]; w.maxH = hh[w.cols - 1];
+  for (const b of w.buildings) { b.gm = w.heightAt(b.c[0], b.c[1]); b.gx = b.gm; }
+
+  const sim = new Sim(w, new RoadGraph(w), { seed: 9 });
+  const g = sim.graph;
+
+  // close a street on the DRY side
+  let dryRoad = -1;
+  for (let e = 0; e < g.edgeCount; e++) {
+    if (g.nx[g.ea[e]] > w.width * 0.3) { dryRoad = g.eroad[e]; break; }
+  }
+  ok('found a dry street to close', dryRoad >= 0);
+  sim.execCommand({ t: 'road', ids: [dryRoad], op: 'close' });
+
+  sim.execCommand({ t: 'sea', level: 5 });
+  ok('flood and player blocks coexist',
+     Array.from(g.blockedFlood).some(Boolean) && Array.from(g.blockedPlayer).some(Boolean));
+
+  sim.execCommand({ t: 'sea', level: -50 });   // drain it completely
+  ok('draining the sea clears flood blocks', !Array.from(g.blockedFlood).some(Boolean));
+  ok('draining the sea does NOT reopen a closed street',
+     Array.from(g.blockedPlayer).some(Boolean));
+
+  sim.execCommand({ t: 'sea', level: 5 });
+  sim.execCommand({ t: 'road', ids: [dryRoad], op: 'open' });
+  ok('reopening a street does NOT un-flood the map',
+     Array.from(g.blockedFlood).some(Boolean));
+}
+
+// tearing out the freeway must actually cost the city something
+{
+  const w = gridTown({ span: 6, block: 120 });
+  // promote the middle east-west road to a motorway
+  const mid = w.roads.findIndex(r => r.k === 'street');
+  w.roads[mid].k = 'highway'; w.roads[mid].c = 'motorway'; w.roads[mid].w = 24;
+
+  const sim = new Sim(w, new RoadGraph(w), { seed: 21 });
+  for (let i = 0; i < 200; i++) sim.tick();
+  const freeways = sim.roadsOfKind('highway');
+  ok('roadsOfKind finds the freeway', freeways.length > 0, String(freeways.length));
+
+  const accessBefore = sim.zoneAccess.reduce((a, b) => a + b, 0);
+  sim.execCommand({ t: 'road', ids: freeways, op: 'remove' });
+  for (let i = 0; i < 60; i++) sim.tick();
+  const accessAfter = sim.zoneAccess.reduce((a, b) => a + b, 0);
+
+  ok('tearing out the freeway is recorded', sim.stats.roadsTorn > 0, String(sim.stats.roadsTorn));
+  ok('tearing out the freeway reduces job access', accessAfter < accessBefore,
+     `${accessAfter.toFixed(0)} vs ${accessBefore.toFixed(0)}`);
+}
+
+// street edits must survive a save
+{
+  const w = gridTown();
+  const sim = new Sim(w, new RoadGraph(w), { seed: 33 });
+  for (let i = 0; i < 60; i++) sim.tick();
+  sim.execCommand({ t: 'road', ids: [sim.graph.eroad[0]], op: 'close' });
+  sim.execCommand({ t: 'road', ids: [sim.graph.eroad[3]], op: 'widen' });
+  for (let i = 0; i < 30; i++) sim.tick();
+
+  const snap = JSON.parse(JSON.stringify(sim.snapshot()));
+  const w2 = gridTown();
+  const sim2 = new Sim(w2, new RoadGraph(w2), { seed: 1 });
+  sim2.restore(snap);
+  ok('street state survives a save', sim2.stateHash() === sim.stateHash(),
+     `${sim2.stateHash()} vs ${sim.stateHash()}`);
+  ok('the closed street is still closed after load',
+     Array.from(sim2.graph.blockedPlayer).some(Boolean));
+
+  for (let i = 0; i < 40; i++) { sim.tick(); sim2.tick(); }
+  ok('a city with edited streets stays in step', sim.stateHash() === sim2.stateHash());
+}
+
 // ── palette: stable and in gamut ───────────────────────────────────────────
 {
   ok('hash01 is in [0,1)', [0, 1, 500, 99999].every(i => {

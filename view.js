@@ -61,6 +61,12 @@ export class View {
     this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // ⚠️ The shadow map re-renders the WHOLE scene. On a 17,000-building city
+    // that is 435k triangles redrawn every frame for a sun that has not moved —
+    // measured at 4.1 ms of a 5.1 ms frame. Refresh it only when the camera has
+    // actually moved enough to matter, or when geometry changes.
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.shadowMap.needsUpdate = true;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.18;
@@ -146,7 +152,11 @@ export class View {
     this.fill = fill;
 
     this._shadowSpan = 0;
+    this._shadowAt = null;      // camera focus/zoom the current shadow map was built for
   }
+
+  /** Force a shadow refresh — call after anything that changes geometry. */
+  invalidateShadows() { this.renderer.shadowMap.needsUpdate = true; }
 
   /**
    * Size the shadow frustum to what the camera can actually see.
@@ -272,11 +282,20 @@ export class View {
     }
   }
 
+  /**
+   * Streets.
+   *
+   * Drivable roads go into ONE vertex-coloured mesh, not one per class, because
+   * the player edits individual streets and we need a per-street vertex range in
+   * order to recolour or hide one. Footways, rail and rivers keep their own
+   * meshes — they are never edited.
+   */
   buildRoads() {
-    const groups = new Map();
     const w = this.world;
+    const c = new THREE.Color();
+    this.roadRange = new Map();          // world.roads index -> {start, end}
 
-    const strip = (pts, width, style, g) => {
+    const strip = (pts, width, style, out, roadIndex) => {
       const simple = simplify(pts, 0.6);
       if (simple.length < 4) return;
       const { left, right } = ribbon(simple, width);
@@ -289,41 +308,111 @@ export class View {
         const r1x = right[(i + 1) * 2], r1z = right[(i + 1) * 2 + 1];
         // Wound L,L,R / R,L,R so the ribbon faces UP — see the winding warning
         // in geom.triangulate; the mirrored order is culled from above.
-        g.pos.push(
+        out.pos.push(
           l0x, y(l0x, l0z), l0z,  l1x, y(l1x, l1z), l1z,  r0x, y(r0x, r0z), r0z,
           r0x, y(r0x, r0z), r0z,  l1x, y(l1x, l1z), l1z,  r1x, y(r1x, r1z), r1z
         );
-        g.n += 6;
+        if (out.col) {
+          c.setHex(style.color);
+          for (let k = 0; k < 6; k++) out.col.push(c.r, c.g, c.b);
+        }
+        if (out.faceRoad) out.faceRoad.push(roadIndex, roadIndex);
+        out.n += 6;
       }
     };
 
-    for (const r of this.world.roads) {
+    // ── the drivable network, one mesh ──────────────────────────────────────
+    const drive = { pos: [], col: [], faceRoad: [], n: 0 };
+    for (let i = 0; i < w.roads.length; i++) {
+      const r = w.roads[i];
       const style = ROAD_STYLE[r.k];
-      if (!style) continue;
-      if (!groups.has(r.k)) groups.set(r.k, { pos: [], n: 0, style });
-      strip(r.pts, r.w, style, groups.get(r.k));
-    }
-    if (this.world.waterways.length) {
-      groups.set('_water', { pos: [], n: 0, style: { color: 0x35617f, y: Y.water } });
-      for (const ww of this.world.waterways) strip(ww.pts, ww.w, groups.get('_water').style, groups.get('_water'));
-    }
-    if (this.world.rails.length) {
-      groups.set('_rail', { pos: [], n: 0, style: { color: 0x605649, y: Y.rail } });
-      for (const rl of this.world.rails) strip(rl.pts, 4.2, groups.get('_rail').style, groups.get('_rail'));
+      if (!style || r.k === 'foot') continue;
+      const from = drive.pos.length / 3;
+      strip(r.pts, r.w, style, drive, i);
+      const to = drive.pos.length / 3;
+      if (to > from) this.roadRange.set(i, { start: from, end: to });
     }
 
-    this.roadMeshes = [];
-    for (const [, g] of groups) {
-      if (!g.n) continue;
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(g.pos, 3));
-      geo.computeVertexNormals();
-      const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: g.style.color }));
-      mesh.receiveShadow = true;
-      mesh.renderOrder = 2;
-      this.scene.add(mesh);
-      this.roadMeshes.push(mesh);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(drive.pos, 3));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(drive.col, 3));
+    geo.computeVertexNormals();
+    this.roadGeo = geo;
+    this.roadBasePos = Float32Array.from(drive.pos);   // to restore a torn street
+    this.roadFace = Int32Array.from(drive.faceRoad);
+    this.roadMesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
+    this.roadMesh.receiveShadow = true;
+    this.roadMesh.renderOrder = 2;
+    this.scene.add(this.roadMesh);
+
+    // ── everything that is never edited ─────────────────────────────────────
+    this.roadMeshes = [this.roadMesh];
+    const extras = [
+      { list: w.roads.filter(r => r.k === 'foot'), style: ROAD_STYLE.foot, width: r => r.w },
+      { list: w.waterways, style: { color: 0x35617f, y: Y.water }, width: r => r.w },
+      { list: w.rails, style: { color: 0x605649, y: Y.rail }, width: () => 4.2 },
+    ];
+    for (const ex of extras) {
+      if (!ex.list.length) continue;
+      const out = { pos: [], n: 0 };
+      for (const r of ex.list) strip(r.pts, ex.width(r), ex.style, out, -1);
+      if (!out.n) continue;
+      const g2 = new THREE.BufferGeometry();
+      g2.setAttribute('position', new THREE.Float32BufferAttribute(out.pos, 3));
+      g2.computeVertexNormals();
+      const m = new THREE.Mesh(g2, new THREE.MeshLambertMaterial({ color: ex.style.color }));
+      m.receiveShadow = true;
+      m.renderOrder = 2;
+      this.scene.add(m);
+      this.roadMeshes.push(m);
     }
+  }
+
+  /**
+   * Repaint streets from sim state. Closed streets go amber, torn-out streets
+   * collapse to zero-area triangles so they vanish without rebuilding the mesh.
+   */
+  paintRoads(state, lanes, selected) {
+    if (!this.roadGeo) return;
+    const posAttr = this.roadGeo.getAttribute('position');
+    const colAttr = this.roadGeo.getAttribute('color');
+    const P = posAttr.array, C = colAttr.array, B = this.roadBasePos;
+    const c = new THREE.Color();
+
+    for (const [roadIndex, range] of this.roadRange) {
+      const st = state ? state[roadIndex] : 0;
+      const isSel = selected && selected.has(roadIndex);
+      const wide = lanes ? lanes[roadIndex] : 1;
+
+      if (st === 2) {
+        // torn out: collapse every triangle onto its own first vertex
+        for (let vtx = range.start; vtx < range.end; vtx += 3) {
+          for (let k = 1; k < 3; k++) {
+            P[(vtx + k) * 3] = P[vtx * 3];
+            P[(vtx + k) * 3 + 1] = P[vtx * 3 + 1];
+            P[(vtx + k) * 3 + 2] = P[vtx * 3 + 2];
+          }
+        }
+        continue;
+      }
+
+      // restore geometry — it may have been collapsed on an earlier pass
+      for (let k = range.start * 3; k < range.end * 3; k++) P[k] = B[k];
+
+      if (isSel) c.setHex(0x63c6ff);
+      else if (st === 1) c.setHex(0xd8a13c);
+      else if (wide > 1.01) c.setHex(0x6f7a86);
+      else if (wide < 0.99) c.setHex(0x484b50);
+      else c.setHex(0x515459);
+
+      for (let vtx = range.start; vtx < range.end; vtx++) {
+        C[vtx * 3] = c.r; C[vtx * 3 + 1] = c.g; C[vtx * 3 + 2] = c.b;
+      }
+    }
+    posAttr.needsUpdate = true;
+    colAttr.needsUpdate = true;
+    this.roadGeo.computeVertexNormals();
+    this.invalidateShadows();     // a torn-out street changes the silhouette
   }
 
   buildBuildings() {
@@ -524,6 +613,7 @@ export class View {
     this.water.renderOrder = 3;
     this.water.receiveShadow = true;
     this.scene.add(this.water);
+    this.invalidateShadows();
     return cells;
   }
 
@@ -644,19 +734,24 @@ export class View {
   /** Pick at normalised device coords. Returns {x, y, z, building}|null. */
   pick(ndcX, ndcY) {
     this._raycaster.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
-    const hits = this._raycaster.intersectObjects([this.buildingMesh, this.terrain], false);
+    const targets = [this.buildingMesh, this.roadMesh, this.terrain].filter(Boolean);
+    const hits = this._raycaster.intersectObjects(targets, false);
     if (!hits.length) return null;
     const hit = hits[0];
     const p = hit.point;
-    let building = null, index = -1;
+    const out = { x: p.x, y: p.y, z: p.z, building: null, index: -1, road: null, roadIndex: -1 };
+
     if (hit.object === this.buildingMesh && hit.faceIndex != null) {
-      index = this.faceOwner[hit.faceIndex];
-      if (index >= 0) building = this.world.buildings[index];
+      out.index = this.faceOwner[hit.faceIndex];
+      if (out.index >= 0) out.building = this.world.buildings[out.index];
+    } else if (hit.object === this.roadMesh && hit.faceIndex != null) {
+      out.roadIndex = this.roadFace[hit.faceIndex];
+      if (out.roadIndex >= 0) out.road = this.world.roads[out.roadIndex];
     } else {
-      building = this.world.buildingAt(p.x, p.z);
-      if (building) index = this.world.buildings.indexOf(building);
+      out.building = this.world.buildingAt(p.x, p.z);
+      if (out.building) out.index = this.world.buildings.indexOf(out.building);
     }
-    return { x: p.x, y: p.y, z: p.z, building, index };
+    return out;
   }
 }
 

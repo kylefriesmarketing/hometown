@@ -68,6 +68,14 @@ export class Sim {
 
     this.floodedB = new Uint8Array(n);
     this.floodedE = new Uint8Array(graph.edgeCount);
+
+    // Street surgery, keyed by index into world.roads — the player edits WHOLE
+    // STREETS, not the graph edges a street happens to be split into.
+    // 0 = as built, 1 = closed to traffic, 2 = torn out entirely.
+    this.roadState = new Uint8Array(world.roads.length);
+    this.roadLanes = new Float32Array(world.roads.length).fill(1);  // capacity multiplier
+    this._applyRoads();
+
     this._rebuildFlood();
 
     this.stats = this._blankStats();
@@ -168,7 +176,13 @@ export class Sim {
    */
   _buildZoneGrid() {
     const w = this.world;
-    const CELL = 200;
+    // ⚠️ Zone size SCALES with the map. At a fixed 200 m, a 4.4 km San Francisco
+    // needs 484 zones — and every zone is a Dijkstra over a 7,000-node graph, so
+    // a tick cost 20 ms and the fast-forward speeds became unreachable. Target a
+    // roughly constant zone COUNT instead, so tick cost stays flat as the world
+    // grows and only the resolution of the traffic model softens.
+    const TARGET_ZONES = 220;
+    const CELL = Math.max(200, Math.round(Math.sqrt(w.width * w.depth / TARGET_ZONES) / 20) * 20);
     this.zCell = CELL;
     this.zCols = Math.max(1, Math.ceil(w.width / CELL));
     this.zRows = Math.max(1, Math.ceil(w.depth / CELL));
@@ -185,6 +199,7 @@ export class Sim {
     this.zonePop = new Float32Array(nz);
     this.zoneJobs = new Float32Array(nz);
     this.zoneAccess = new Float32Array(nz);
+    this.zoneCommute = new Float32Array(nz);   // mean minutes to work, per zone
     this.zoneNode = new Int32Array(nz).fill(-1);
     for (let j = 0; j < this.zRows; j++) {
       for (let i = 0; i < this.zCols; i++) {
@@ -238,6 +253,28 @@ export class Sim {
     this._floodDirty = false;
   }
 
+  /**
+   * Push per-street player edits down onto the graph edges.
+   * Cheap and idempotent, so it can be called after any road command.
+   */
+  _applyRoads() {
+    const g = this.graph;
+    const blocked = new Uint8Array(g.edgeCount);
+    for (let e = 0; e < g.edgeCount; e++) {
+      const r = g.eroad[e];
+      blocked[e] = this.roadState[r] === 0 ? 0 : 1;
+      g.capMul[e] = this.roadLanes[r];
+    }
+    g.setPlayerBlocked(blocked);
+  }
+
+  /** Indices of every street matching a class filter — the freeway what-if. */
+  roadsOfKind(kind) {
+    const out = [];
+    this.world.roads.forEach((r, i) => { if (r.k === kind) out.push(i); });
+    return out;
+  }
+
   // ── the tick ─────────────────────────────────────────────────────────────
 
   tick() {
@@ -274,7 +311,11 @@ export class Sim {
    * network never shows a half-updated picture.
    */
   _trafficSlice() {
-    const per = Math.max(1, Math.ceil(this.nZones / SIM.zoneSliceTicks));
+    // Hard ceiling on routing per tick. A bigger city takes proportionally
+    // longer to complete one sweep — which is fine, traffic does not change
+    // daily — but no single tick is ever allowed to become expensive.
+    const per = Math.max(1, Math.min(SIM.maxRoutesPerTick,
+      Math.ceil(this.nZones / SIM.zoneSliceTicks)));
     const path = [];
     for (let s = 0; s < per; s++) {
       const z = this._zCursor;
@@ -293,7 +334,7 @@ export class Sim {
     const g = this.graph;
     const from = this.zoneNode[z];
     const workers = this.zonePop[z] * SIM.workforceShare;
-    if (from < 0) { this.zoneAccess[z] = 0; return; }
+    if (from < 0) { this.zoneAccess[z] = 0; this.zoneCommute[z] = 0; return; }
 
     const dist = g.dijkstra(from, SIM.commuteHorizon);
 
@@ -314,6 +355,17 @@ export class Sim {
     }
 
     this.zoneAccess[z] = reach;
+    // Mean commute for this zone, weighted the same way the trips are — free,
+    // because we already have the distances. This is the number that actually
+    // MOVES when a street is closed or a freeway comes out, which is what makes
+    // street surgery legible instead of abstract.
+    let wSum = 0, tSum = 0;
+    for (let k = 0; k < weights.length; k += 3) {
+      tSum += dist[weights[k + 2]] * weights[k + 1];
+      wSum += weights[k + 1];
+    }
+    this.zoneCommute[z] = wSum > 0 ? tSum / wSum : 0;
+
     if (workers <= 0 || reach <= 0) return;
 
     // vehicles/hour at peak, distributed along each shortest path
@@ -492,6 +544,22 @@ export class Sim {
     s.congested = this.graph.edgeCount > 0 ? congested / this.graph.edgeCount : 0;
 
     s.flood = this.floodStats || { buildings: 0, displaced: 0, roads: 0 };
+    let closed = 0, torn = 0;
+    for (let i = 0; i < this.roadState.length; i++) {
+      if (this.roadState[i] === 1) closed++;
+      else if (this.roadState[i] === 2) torn++;
+    }
+    s.roadsClosed = closed; s.roadsTorn = torn;
+
+    let cw = 0, ct = 0, stranded = 0;
+    for (let z = 0; z < this.nZones; z++) {
+      const pop = this.zonePop[z];
+      if (pop <= 0) continue;
+      if (this.zoneCommute[z] > 0) { ct += this.zoneCommute[z] * pop; cw += pop; }
+      else stranded += pop;                      // lives somewhere with no reachable work
+    }
+    s.commute = cw > 0 ? ct / cw : 0;
+    s.stranded = stranded;
     s.seaLevel = this.seaLevel;
     this.stats = s;
     return s;
@@ -520,6 +588,7 @@ export class Sim {
       case 'rezone': return this._cmdRezone(cmd);
       case 'demolish': return this._cmdDemolish(cmd);
       case 'sea': return this._cmdSea(cmd);
+      case 'road': return this._cmdRoad(cmd);
       default: return { ok: false, reason: `unknown command "${cmd.t}"` };
     }
   }
@@ -581,6 +650,38 @@ export class Sim {
     return { ok: true, level, ...this.floodStats };
   }
 
+  /**
+   * Street surgery: close, reopen, tear out, widen or narrow whole streets.
+   * Free — this is a what-if sandbox, not a public works budget.
+   */
+  _cmdRoad(cmd) {
+    const ids = (cmd.ids || []).filter(i => i >= 0 && i < this.roadState.length);
+    if (!ids.length) return { ok: false, reason: 'no streets selected' };
+
+    let changed = 0;
+    for (const i of ids) {
+      const before = this.roadState[i] + ':' + this.roadLanes[i];
+      switch (cmd.op) {
+        case 'close':   this.roadState[i] = 1; break;
+        case 'open':    this.roadState[i] = 0; break;
+        case 'remove':  this.roadState[i] = 2; break;
+        case 'widen':   this.roadLanes[i] = Math.min(4, this.roadLanes[i] + 0.5); break;
+        case 'narrow':  this.roadLanes[i] = Math.max(0.25, this.roadLanes[i] - 0.5); break;
+        default: return { ok: false, reason: `unknown road op "${cmd.op}"` };
+      }
+      if (before !== this.roadState[i] + ':' + this.roadLanes[i]) changed++;
+    }
+
+    this._applyRoads();
+    // The network changed shape, so every route is stale — redo it in one pass
+    // rather than letting the round-robin bleed old paths in for a month.
+    this._aggregateZones();
+    this._fullTrafficPass();
+    for (let i = 0; i < this.n; i++) this._updateDesire(i);
+    this._recomputeTotals();
+    return { ok: true, count: changed, op: cmd.op };
+  }
+
   // ── save / load / hash ───────────────────────────────────────────────────
 
   /**
@@ -601,6 +702,8 @@ export class Sim {
       day: this.day, money: this.money, bankrupt: this.bankrupt,
       seaLevel: this.seaLevel,
       zone: Array.from(this.zone),
+      roadState: Array.from(this.roadState),
+      roadLanes: Array.from(this.roadLanes),
       occ: Array.from(this.occ),
       bCursor: this._bCursor, zCursor: this._zCursor,
       // ⚠️⚠️ ROUND-ROBIN UPDATES TURN "DERIVED" VALUES INTO STATE, and all three
@@ -616,6 +719,7 @@ export class Sim {
       nextLoad: Array.from(this._nextLoad),
       desire: Array.from(this.desire),
       zoneAccess: Array.from(this.zoneAccess),
+      zoneCommute: Array.from(this.zoneCommute),
       history: this.history.slice(),
     };
   }
@@ -630,6 +734,8 @@ export class Sim {
     this.seaLevel = s.seaLevel ?? 0;
     this.zone.set(s.zone);
     this.occ.set(s.occ);
+    if (s.roadState) this.roadState.set(s.roadState);
+    if (s.roadLanes) this.roadLanes.set(s.roadLanes);
     this._bCursor = s.bCursor | 0;
     this._zCursor = s.zCursor | 0;
     this.history = (s.history || []).slice();
@@ -639,10 +745,12 @@ export class Sim {
     this._nextLoad.set(s.nextLoad);
     this.desire.set(s.desire);
     this.zoneAccess.set(s.zoneAccess);
+    if (s.zoneCommute) this.zoneCommute.set(s.zoneCommute);
 
     // Only genuinely pure values are rebuilt: capacity follows from zoning,
     // nuisance from where industry now is, totals from occupancy.
     for (let i = 0; i < this.n; i++) this.cap[i] = this._capacityOf(i, this.zone[i]);
+    this._applyRoads();
     this._rebuildFlood();
     this._rebuildNuisance();
     this._aggregateZones();
@@ -669,12 +777,17 @@ export class Sim {
     mix(this.bankrupt ? 1 : 0);
     mix(this._bCursor); mix(this._zCursor);
     mix(Math.round(this.seaLevel * 1000));
+    for (let i = 0; i < this.roadState.length; i++) {
+      mix(this.roadState[i] * 13 + 3);
+      mix(Math.round(this.roadLanes[i] * 100));
+    }
     for (let i = 0; i < this.n; i++) {
       mix(this.zone[i] * 31 + 7);
       mix(Math.round(this.occ[i] * 1000));
     }
     for (let i = 0; i < this.n; i++) mix(Math.round(this.desire[i] * 1000));
     for (let z = 0; z < this.nZones; z++) mix(Math.round(this.zoneAccess[z] * 1000));
+    for (let z = 0; z < this.nZones; z++) mix(Math.round(this.zoneCommute[z] * 1000));
     for (let e = 0; e < this.graph.edgeCount; e++) {
       mix(Math.round(this.graph.load[e] * 1000));
       mix(Math.round(this._nextLoad[e] * 1000));

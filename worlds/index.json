@@ -8,9 +8,17 @@
   },
   {
     "name": "russian-hill",
-    "label": "Russian Hill, San Francisco",
+    "label": "Russian Hill (small)",
     "buildings": 5857,
     "km2": 3.24,
     "relief": 121.2
+  },
+  {
+    "name": "san-francisco",
+    "label": "San Francisco",
+    "buildings": 17636,
+    "km2": 19.36,
+    "relief": 144,
+    "flagship": true
   }
 ]

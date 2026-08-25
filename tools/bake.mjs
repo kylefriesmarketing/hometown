@@ -279,8 +279,11 @@ function enrichBuildingKinds(buildings, areas, pois, log) {
   return { poi: byPoi, landuse: byLanduse };
 }
 
+let MIN_AREA = 8;
+
 async function bake(opts) {
   const log = (...a) => console.log(...a);
+  MIN_AREA = Number(opts.minArea || 8);
 
   // 1. resolve the area ------------------------------------------------------
   let bbox, label = opts.name;
@@ -351,7 +354,9 @@ async function bake(opts) {
   const addBuilding = (tags, pts, id) => {
     if (pts.length < 3) return;
     const area = ringArea(pts);
-    if (area < 8) return;                       // sub-shed noise; not worth a mesh
+    // A big-radius bake is dominated by sheds and garages, so --minArea lets a
+    // flagship map shed the noise without losing the city.
+    if (area < MIN_AREA) return;
     const kind = buildingKind(tags);
     const { height, levels, guessed } = buildingHeight(tags, kind);
     const c = ringCentroid(pts);

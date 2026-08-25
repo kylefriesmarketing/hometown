@@ -97,6 +97,8 @@ export const SIM = {
   /** Buildings and zone-accessibility are refreshed round-robin over N ticks. */
   buildingSliceTicks: 24,
   zoneSliceTicks: 30,
+  /** Hard ceiling on Dijkstra runs per tick, whatever the city size. */
+  maxRoutesPerTick: 5,
 
   /** Travel time (minutes) beyond which a job may as well not exist. */
   commuteHorizon: 45,

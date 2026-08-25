@@ -55,6 +55,13 @@ export class RoadGraph {
     this.world = world;
     this._build(world);
     this.load = new Float32Array(this.edgeCount);      // vehicles per hour, per edge
+    // Two INDEPENDENT reasons an edge can be shut, kept apart on purpose: the
+    // sea receding must not reopen a street the player closed, and reopening a
+    // street must not undo a flood. `_shut` is the OR of the two.
+    this.blockedFlood = new Uint8Array(this.edgeCount);
+    this.blockedPlayer = new Uint8Array(this.edgeCount);
+    this._shut = new Uint8Array(this.edgeCount);
+    this.capMul = new Float32Array(this.edgeCount).fill(1);
     // Dijkstra scratch, reused across calls so routing allocates nothing.
     this._dist = new Float32Array(this.nodeCount);
     this._prevEdge = new Int32Array(this.nodeCount);
@@ -66,7 +73,12 @@ export class RoadGraph {
     // ── pass 1: which coordinates are junctions? ─────────────────────────────
     // A point is a node if two or more ways touch it, or if it is a way's end.
     const touch = new Map();
-    const drivable = world.roads.filter(r => r.k !== 'foot');
+    // ⚠️ Keep the ORIGINAL index into world.roads. `drivable` is a filtered
+    // list, so an index into it is not an index into the world — and the player
+    // edits WHOLE STREETS, which are addressed by their world index.
+    const drivable = [];
+    const drivableIdx = [];
+    world.roads.forEach((r, i) => { if (r.k !== 'foot') { drivable.push(r); drivableIdx.push(i); } });
     for (const r of drivable) {
       for (let i = 0; i < r.pts.length; i += 2) {
         const k = key(r.pts[i], r.pts[i + 1]);
@@ -108,7 +120,7 @@ export class RoadGraph {
         const b = nodeFor(qx, qz);
         if (a !== b && runLen > 0.5) {
           ea.push(a); eb.push(b); elen.push(runLen);
-          espeed.push(speed); ecap.push(Math.max(200, cap)); eroad.push(ri);
+          espeed.push(speed); ecap.push(Math.max(200, cap)); eroad.push(drivableIdx[ri]);
         }
         segStart = i; runLen = 0;
       }
@@ -123,8 +135,9 @@ export class RoadGraph {
     this.elen = Float32Array.from(elen);
     this.espeed = Float32Array.from(espeed);
     this.ecap = Float32Array.from(ecap);
-    this.eroad = Int32Array.from(eroad);
+    this.eroad = Int32Array.from(eroad);      // -> index into world.roads
     this.drivable = drivable;
+    this.drivableIdx = Int32Array.from(drivableIdx);
 
     // free-flow traversal time, minutes
     this.freeTime = new Float32Array(this.edgeCount);
@@ -201,11 +214,23 @@ export class RoadGraph {
    * than driving through it — that is what makes drowning a street a MECHANIC
    * and not a paint job.
    */
-  setFlooded(flags) { this.blocked = flags; }
+  setFlooded(flags) { this.blockedFlood.set(flags); this._refreshShut(); }
+
+  /** Player-closed streets (torn out, pedestrianised, or simply shut). */
+  setPlayerBlocked(flags) { this.blockedPlayer.set(flags); this._refreshShut(); }
+
+  _refreshShut() {
+    for (let e = 0; e < this.edgeCount; e++) {
+      this._shut[e] = (this.blockedFlood[e] || this.blockedPlayer[e]) ? 1 : 0;
+    }
+  }
+
+  /** Effective capacity after the player has widened or narrowed a street. */
+  capacityOf(e) { return Math.max(120, this.ecap[e] * this.capMul[e]); }
 
   /** Congested traversal time (minutes) for an edge, BPR volume-delay. */
   edgeTime(e) {
-    const ratio = this.load[e] / this.ecap[e];
+    const ratio = this.load[e] / this.capacityOf(e);
     return this.freeTime[e] * (1 + BPR.alpha * Math.pow(ratio, BPR.beta));
   }
 
@@ -231,7 +256,7 @@ export class RoadGraph {
       for (let k = this.adjStart[u]; k < this.adjStart[u + 1]; k++) {
         const v = this.adjNode[k], e = this.adjEdge[k];
         if (done[v]) continue;
-        if (this.blocked && this.blocked[e]) continue;   // under water / torn out
+        if (this._shut[e]) continue;                     // under water / torn out
         const nd = du + this.edgeTime(e);
         if (nd < dist[v]) { dist[v] = nd; prev[v] = e; heap.push(nd, v); }
       }

@@ -100,7 +100,8 @@ canvas.addEventListener('pointerup', e => {
     const ny = -((e.clientY - r.top) / r.height) * 2 + 1;
     try {
       const hit = view.pick(nx, ny);
-      game.select(hit && hit.building ? hit.index : -1, e.shiftKey);
+      if (hit && hit.roadIndex >= 0) game.selectRoad(hit.roadIndex, e.shiftKey);
+      else game.select(hit && hit.building ? hit.index : -1, e.shiftKey);
     } catch (err) { console.warn('pick failed', err); }
   }
   drag = null;
@@ -203,6 +204,7 @@ document.getElementById('opt-shadows').addEventListener('change', e => {
   view.renderer.shadowMap.enabled = e.target.checked;
   // three.js caches compiled programs against shadow state; force a rebuild.
   view.scene.traverse(o => { if (o.material) o.material.needsUpdate = true; });
+  view.invalidateShadows();
 });
 
 // ─── loop ─────────────────────────────────────────────────────────────────
@@ -229,7 +231,10 @@ function loop(now) {
     pick.addEventListener('change', () => loadWorld(pick.value).catch(showError));
 
     const params = new URLSearchParams(location.search);
-    const want = params.get('world') || worlds[0].name;
+    // The flagship opens by default; the manifest is sorted alphabetically, so
+    // without this the first world alphabetically would greet every new player.
+    const flagship = worlds.find(w => w.flagship) || worlds[0];
+    const want = params.get('world') || flagship.name;
     pick.value = worlds.some(w => w.name === want) ? want : worlds[0].name;
 
     await loadWorld(pick.value);
