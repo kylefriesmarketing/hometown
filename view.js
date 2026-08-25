@@ -481,6 +481,52 @@ export class View {
     this.scene.add(mesh);
   }
 
+  /**
+   * Build the sea surface from a flood mask — one quad per flooded cell.
+   *
+   * ⚠️ Deliberately NOT one big plane at y = level. The mask is a connected
+   * flood from the map edge, so a big plane would also cover dry inland ground
+   * that merely happens to sit below sea level, and anyone who knows the place
+   * would spot it instantly.
+   */
+  buildWater(mask, level) {
+    if (this.water) {
+      this.scene.remove(this.water);
+      this.water.geometry.dispose();
+      this.water = null;
+    }
+    if (!mask) return 0;
+
+    const w = this.world;
+    const { cols, rows, cell } = w;
+    const pos = [];
+    let cells = 0;
+    for (let j = 0; j < rows - 1; j++) {
+      for (let i = 0; i < cols - 1; i++) {
+        if (!mask[j * cols + i]) continue;
+        const x = w.x0 + i * cell, z = w.z0 + j * cell;
+        const x1 = x + cell, z1 = z + cell;
+        // wound to face UP, same convention as everything else here
+        pos.push(x, level, z,  x, level, z1,  x1, level, z);
+        pos.push(x1, level, z,  x, level, z1,  x1, level, z1);
+        cells++;
+      }
+    }
+    if (!cells) return 0;
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.computeVertexNormals();
+    this.water = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+      color: 0x2f6489, transparent: true, opacity: 0.82,
+      depthWrite: false,
+    }));
+    this.water.renderOrder = 3;
+    this.water.receiveShadow = true;
+    this.scene.add(this.water);
+    return cells;
+  }
+
   // ─── colouring ────────────────────────────────────────────────────────────
 
   /**

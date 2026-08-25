@@ -14,27 +14,44 @@ Two free, key-less data sources — no Google, no API key, no per-request bill:
 
 ---
 
-## Status — M1 complete (2026-08-25)
+## Status — M2: it is a playable what-if sandbox (2026-08-25)
 
-**M1 — THE BOARD: done and verified.** You can bake any place on Earth and fly
-over it. `node test.mjs` = **75 tests, all green**.
+**M1 (the map) and M2 (the simulation) are both done and verified.**
+`node test.mjs && node test-sim.mjs` = **150 tests, all green**.
 
-What works right now:
-- `tools/bake.mjs` turns a place name, a centre+radius, or a bbox into a world file
-- terrain, buildings (extruded, real heights), roads, parks, water, rail, POIs
-- land-use inference for buildings OSM only tagged `building=yes`
-- an RTS camera, and a probe that tells you what any building actually is
-- 400 fps on 5,857 buildings — plenty of headroom for a sim
+The design is a **what-if sandbox**: no fail state, no score. You inherit a real
+town and you break it — flood it, rezone it, tear things out — and watch the
+place react. San Francisco is the flagship.
 
-**There is no simulation yet.** No zoning, economy, population or growth. M1 is
-the map, which was the load-bearing unknown; the sim is M2. See *Next* below.
+What works:
+- bake any place on Earth into a playable world
+- a deterministic city sim on the REAL street graph and REAL terrain: capacity
+  from actual floor area, desirability from actual grade, road access, job
+  reach, parks, services and industrial nuisance
+- gravity commuting with BPR congestion over a routable OSM street network
+- **sea level**: raise it and watch which real streets go under. Buildings drown,
+  people are displaced, and flooded street segments are CUT from the network so
+  traffic genuinely reroutes around the water
+- five overlays (zoning, occupancy, desirability, job access, congestion)
+- click to select, rezone, demolish; speed controls; a live HUD
+
+⚠️ **There is no pressure yet, by design and by omission.** Measured over one
+simulated year of San Francisco: population 62k → 88k, treasury $25k → $1.96M,
+unemployment 0.0%, congestion 1%. The city fixes itself and prints money. That is
+fine for a sandbox and fatal for a game with goals — if this ever grows a
+scenario mode, money must be able to run out and people must be able to leave.
+
+Still to build from the chosen direction: **roads & transit** (draw, widen,
+pedestrianise, run a line — the graph already supports it), **services**
+(coverage fields already exist, mostly UI), and the **before/after slider +
+share link**.
 
 Baked worlds:
 
 | world | area | buildings | relief | note |
 |---|---|---|---|---|
-| `russian-hill` | 3.2 km² | 5,857 | 121 m | dense San Francisco; 70% of heights are real OSM data |
-| `myrtle-beach` | 4.8 km² | 758 | 13 m | flat coastal sprawl; only 4% real heights — the honest opposite case |
+| `russian-hill` | 3.2 km² | 5,857 | 121 m | flagship. Dense SF; 70% of heights are real OSM data |
+| `myrtle-beach` | 4.8 km² | 758 | 13 m | flat coastal sprawl; the best flood demo |
 
 ---
 
@@ -44,10 +61,12 @@ Baked worlds:
 node serve.mjs 8469
 ```
 
+Live: **https://kylefriesmarketing.github.io/hometown/**
+
 Then open `http://localhost:8469`. Add `?world=russian-hill` to pick one.
 
 ```bash
-node test.mjs
+node test.mjs && node test-sim.mjs
 ```
 
 ## Bake your own town
@@ -77,6 +96,12 @@ Strict separation, so the sim can arrive without touching the renderer:
 | `world.js` | the baked place + every query about it | pure. No three.js, no DOM, **no randomness** |
 | `view.js` | all rendering | view-only. `Math.random` is allowed HERE and nowhere else |
 | `ui.js` | DOM panels | reads only; writes no state |
+| `graph.js` | routable street network + Dijkstra | pure; topology from coordinate identity |
+| `field.js` | distance fields, flood fill | pure |
+| `sim.js` | the deterministic city simulation | **no `Math.random`, no DOM, no Date.** `execCommand` is the only mutation path |
+| `data.js` | ALL tuning | balance changes go here and nowhere else |
+| `palette.js` | how the city is coloured | pure data |
+| `game.js` | play layer: HUD, overlays, selection, clock | issues commands; never writes sim state |
 | `main.js` | boot, input, frame loop | — |
 | `tools/bake.mjs` | the pipeline | bake-time only |
 | `tools/osm.js` | OSM tags → game features | bake-time only; the runtime never sees a raw tag |
@@ -129,7 +154,25 @@ Strict separation, so the sim can arrive without touching the renderer:
    the console. The render and the `toDataURL` must stay in one synchronous
    task, or you get a blank image.
 
-8. **Reload between destructive probes.** A probe that swaps a material and
+8. **Round-robin updates turn "derived" values into STATE.** Traffic load,
+   desirability and zone accessibility are each refreshed a slice at a time, so
+   what is stored is a mosaic of many ticks. Rebuilding them in one pass at
+   restore produced a different city that hashed identically at the save and
+   drifted apart 40 ticks later. They are snapshotted and hashed. If you add
+   another sliced update, it belongs there too.
+
+9. **A save must be LOSSLESS.** Arrays were quantised to 3 decimals and the
+   round-trip test passed — because `stateHash` quantises to 3 decimals too, so
+   both sides rounded to the same number while the floats differed by 5e-4. The
+   city is a feedback loop and amplified that within one tick. Do not "tidy"
+   snapshot arrays by rounding them.
+
+10. **Flooding is a connected fill from the map edge, and strictly BELOW the
+    waterline.** A simple `height <= level` test fills inland hollows the sea
+    cannot reach, and `<=` drowns an entire town whose terrain sits flat at 0 m
+    the moment sea level is 0 — which is the default.
+
+11. **Reload between destructive probes.** A probe that swaps a material and
    leaves it swapped means the next measurement is measuring the probe.
 
 ---

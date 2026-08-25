@@ -63,6 +63,7 @@ export class Game {
     this._hudT = 0;
 
     this._buildSpeeds();
+    this._buildSeaSlider();
     this._buildOverlays();
     this._buildZoneButtons();
     this.refreshHud();
@@ -102,6 +103,29 @@ export class Game {
       row.appendChild(b);
     });
     this.setSpeed(1);
+  }
+
+  // ── the sea ──────────────────────────────────────────────────────────────
+
+  _buildSeaSlider() {
+    const el = $('sea-slider');
+    if (!el) return;
+    el.addEventListener('input', () => this.setSea(+el.value / 10));
+    this.setSea(0);
+  }
+
+  setSea(level) {
+    const r = this.sim.execCommand({ t: 'sea', level });
+    if (!r.ok) return;
+    const cells = this.view.buildWater(this.sim.floodMask, level);
+    $('sea-value').textContent = (level >= 0 ? '+' : '') + level.toFixed(1) + ' m';
+    const f = this.sim.floodStats;
+    $('sea-info').innerHTML = level === 0 && !f.buildings
+      ? 'drag to raise the sea'
+      : `<b>${fmt(f.buildings)}</b> buildings under water · <b>${fmt(f.displaced)}</b> people displaced · <b>${f.roads}</b> streets cut`;
+    this.refreshHud();
+    this.repaintOverlay(true);
+    void cells;
   }
 
   // ── HUD ──────────────────────────────────────────────────────────────────

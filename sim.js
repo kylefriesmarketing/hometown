@@ -16,7 +16,7 @@ import {
   TICK, ZONES, ZONE_KINDS, ZONE_INDEX, SIM, DESIRE, FALLOFF, SLOPE_HALF,
   SERVICES, REZONE_COST_PER_M2, DEMOLISH_COST_PER_M2,
 } from './data.js';
-import { chamferFrom, sampleField, stampPoint } from './field.js';
+import { chamferFrom, sampleField, stampPoint, floodFromEdges, maskAt } from './field.js';
 
 const Z_NONE = ZONE_INDEX.none;
 const Z_RES = ZONE_INDEX.residential;
@@ -46,6 +46,7 @@ export class Sim {
     this.day = 0;
     this.money = opts.startMoney ?? SIM.startMoney;
     this.bankrupt = false;
+    this.seaLevel = opts.seaLevel ?? 0;
 
     const n = world.buildings.length;
     this.n = n;
@@ -64,6 +65,10 @@ export class Sim {
     this._bCursor = 0;
     this._zCursor = 0;
     this._nextLoad = new Float32Array(graph.edgeCount);
+
+    this.floodedB = new Uint8Array(n);
+    this.floodedE = new Uint8Array(graph.edgeCount);
+    this._rebuildFlood();
 
     this.stats = this._blankStats();
     this.history = [];
@@ -190,6 +195,49 @@ export class Sim {
     this.nZones = nz;
   }
 
+  /**
+   * Recompute what the sea has taken.
+   *
+   * Drowned buildings lose their occupants and cannot grow; drowned road edges
+   * are cut from the network, so traffic genuinely reroutes around the water
+   * instead of driving through it. That second part is what makes flooding a
+   * MECHANIC rather than a filter.
+   */
+  _rebuildFlood() {
+    const w = this.world;
+    this.floodMask = floodFromEdges(w.heights, w.cols, w.rows, this.seaLevel);
+
+    let drowned = 0, displaced = 0;
+    for (let i = 0; i < this.n; i++) {
+      const c = w.buildings[i].c;
+      const under = maskAt(this.floodMask, w.cols, w.rows, w.cell, w.x0, w.z0, c[0], c[1])
+        && w.buildings[i].gm < this.seaLevel;
+      this.floodedB[i] = under ? 1 : 0;
+      if (under) {
+        drowned++;
+        displaced += this.occ[i];
+        this.occ[i] = 0;
+        this.desire[i] = 0;
+      }
+    }
+
+    const g = this.graph;
+    let cutEdges = 0;
+    for (let e = 0; e < g.edgeCount; e++) {
+      const mx = (g.nx[g.ea[e]] + g.nx[g.eb[e]]) / 2;
+      const mz = (g.nz[g.ea[e]] + g.nz[g.eb[e]]) / 2;
+      const under = maskAt(this.floodMask, w.cols, w.rows, w.cell, w.x0, w.z0, mx, mz)
+        && w.heightAt(mx, mz) < this.seaLevel;
+      this.floodedE[e] = under ? 1 : 0;
+      if (under) cutEdges++;
+    }
+    g.setFlooded(this.floodedE);
+
+    this.floodStats = { buildings: drowned, displaced, roads: cutEdges,
+      roadKmLost: cutEdges / Math.max(1, g.edgeCount) };
+    this._floodDirty = false;
+  }
+
   // ── the tick ─────────────────────────────────────────────────────────────
 
   tick() {
@@ -292,6 +340,7 @@ export class Sim {
       this._bCursor = (this._bCursor + 1) % this.n;
       const z = this.zone[i];
       if (z === Z_NONE) { this.occ[i] = 0; continue; }
+      if (this.floodedB[i]) { this.occ[i] = 0; this.desire[i] = 0; continue; }
 
       this._updateDesire(i);
       const d = this.desire[i];
@@ -442,6 +491,8 @@ export class Sim {
     }
     s.congested = this.graph.edgeCount > 0 ? congested / this.graph.edgeCount : 0;
 
+    s.flood = this.floodStats || { buildings: 0, displaced: 0, roads: 0 };
+    s.seaLevel = this.seaLevel;
     this.stats = s;
     return s;
   }
@@ -468,6 +519,7 @@ export class Sim {
     switch (cmd.t) {
       case 'rezone': return this._cmdRezone(cmd);
       case 'demolish': return this._cmdDemolish(cmd);
+      case 'sea': return this._cmdSea(cmd);
       default: return { ok: false, reason: `unknown command "${cmd.t}"` };
     }
   }
@@ -516,6 +568,19 @@ export class Sim {
     return { ok: true, cost, count: ids.length };
   }
 
+  /** Move the sea. Free — this is a what-if, not a public works project. */
+  _cmdSea(cmd) {
+    const level = Number(cmd.level);
+    if (!Number.isFinite(level)) return { ok: false, reason: 'bad sea level' };
+    if (level === this.seaLevel) return { ok: true, level, unchanged: true };
+    this.seaLevel = level;
+    this._rebuildFlood();
+    this._aggregateZones();
+    this._fullTrafficPass();
+    this._recomputeTotals();
+    return { ok: true, level, ...this.floodStats };
+  }
+
   // ── save / load / hash ───────────────────────────────────────────────────
 
   /**
@@ -534,6 +599,7 @@ export class Sim {
       v: 2,
       seed: this.seed, rng: this.rng,
       day: this.day, money: this.money, bankrupt: this.bankrupt,
+      seaLevel: this.seaLevel,
       zone: Array.from(this.zone),
       occ: Array.from(this.occ),
       bCursor: this._bCursor, zCursor: this._zCursor,
@@ -561,6 +627,7 @@ export class Sim {
     this.day = s.day;
     this.money = s.money;
     this.bankrupt = !!s.bankrupt;
+    this.seaLevel = s.seaLevel ?? 0;
     this.zone.set(s.zone);
     this.occ.set(s.occ);
     this._bCursor = s.bCursor | 0;
@@ -576,6 +643,7 @@ export class Sim {
     // Only genuinely pure values are rebuilt: capacity follows from zoning,
     // nuisance from where industry now is, totals from occupancy.
     for (let i = 0; i < this.n; i++) this.cap[i] = this._capacityOf(i, this.zone[i]);
+    this._rebuildFlood();
     this._rebuildNuisance();
     this._aggregateZones();
     this._recomputeTotals();
@@ -600,6 +668,7 @@ export class Sim {
     mix(Math.round(this.money * 100));
     mix(this.bankrupt ? 1 : 0);
     mix(this._bCursor); mix(this._zCursor);
+    mix(Math.round(this.seaLevel * 1000));
     for (let i = 0; i < this.n; i++) {
       mix(this.zone[i] * 31 + 7);
       mix(Math.round(this.occ[i] * 1000));

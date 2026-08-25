@@ -195,6 +195,14 @@ export class RoadGraph {
     return best;
   }
 
+  /**
+   * Mark edges as impassable (flooded, demolished, closed to cars).
+   * Routing skips them entirely, so the network reroutes around the gap rather
+   * than driving through it — that is what makes drowning a street a MECHANIC
+   * and not a paint job.
+   */
+  setFlooded(flags) { this.blocked = flags; }
+
   /** Congested traversal time (minutes) for an edge, BPR volume-delay. */
   edgeTime(e) {
     const ratio = this.load[e] / this.ecap[e];
@@ -223,6 +231,7 @@ export class RoadGraph {
       for (let k = this.adjStart[u]; k < this.adjStart[u + 1]; k++) {
         const v = this.adjNode[k], e = this.adjEdge[k];
         if (done[v]) continue;
+        if (this.blocked && this.blocked[e]) continue;   // under water / torn out
         const nd = du + this.edgeTime(e);
         if (nd < dist[v]) { dist[v] = nd; prev[v] = e; heap.push(nd, v); }
       }

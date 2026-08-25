@@ -8,7 +8,7 @@
 import { World } from './world.js';
 import { RoadGraph } from './graph.js';
 import { Sim } from './sim.js';
-import { chamfer, chamferFrom, sampleField, stampPolyline } from './field.js';
+import { chamfer, chamferFrom, sampleField, stampPolyline, floodFromEdges } from './field.js';
 import { ZONE_INDEX } from './data.js';
 import { wallColour, roofColour, hash01 } from './palette.js';
 
@@ -279,6 +279,89 @@ function gridTown({ span = 4, block = 100, pad = 0 } = {}) {
   for (let i = 0; i < 150; i++) sim.tick();
   ok('industry next door hurts housing', sim.desire[victim] < beforeD,
      `${sim.desire[victim].toFixed(3)} vs ${beforeD.toFixed(3)}`);
+}
+
+
+// ── flooding ───────────────────────────────────────────────────────────────
+{
+  // A bowl: high rim, low middle, with ONE low channel out to the west edge.
+  const cols = 21, rows = 21, cell = 10;
+  const heights = new Float32Array(cols * rows).fill(10);
+  for (let j = 8; j <= 12; j++) for (let i = 8; i <= 12; i++) heights[j * cols + i] = -2; // inner basin
+  for (let j = 2; j <= 4; j++) for (let i = 0; i <= 4; i++) heights[j * cols + i] = -2;   // sea inlet at the edge
+
+  const dry = floodFromEdges(heights, cols, rows, 0);
+  const inlet = dry[3 * cols + 1], basin = dry[10 * cols + 10];
+  ok('the sea floods in from the edge', inlet === 1);
+  // ⚠️ THE POINT OF A CONNECTED FILL: the basin is below sea level but the sea
+  // cannot reach it, so it must stay dry. A plain height test floods it.
+  ok('an unreachable basin stays dry', basin === 0);
+
+  // carve a channel and it must fill
+  for (let i = 4; i <= 8; i++) heights[10 * cols + i] = -2;
+  for (let j = 4; j <= 10; j++) heights[j * cols + 4] = -2;
+  const joined = floodFromEdges(heights, cols, rows, 0);
+  ok('a connected basin does flood', joined[10 * cols + 10] === 1);
+
+  ok('a low sea floods less than a high sea', (() => {
+    const lo = floodFromEdges(heights, cols, rows, -1);
+    const hi = floodFromEdges(heights, cols, rows, 11);   // above the 10 m rim
+    let a = 0, b = 0;
+    for (let i = 0; i < lo.length; i++) { a += lo[i]; b += hi[i]; }
+    return b > a;
+  })());
+}
+
+// flooding must actually change the city, not just tint it
+{
+  const w = gridTown();
+  // tilt the whole town so the west half is below sea level
+  const hh = new Float32Array(w.cols * w.rows);
+  for (let j = 0; j < w.rows; j++) {
+    for (let i = 0; i < w.cols; i++) hh[j * w.cols + i] = (i - w.cols / 2) * 0.6;
+  }
+  w.heights = hh; w.minH = hh[0]; w.maxH = hh[w.cols - 1];
+  for (const b of w.buildings) { b.gm = w.heightAt(b.c[0], b.c[1]); b.gx = b.gm; }
+
+  const sim = new Sim(w, new RoadGraph(w), { seed: 8 });
+  for (let i = 0; i < 120; i++) sim.tick();
+  const before = { pop: sim.stats.population, hash: sim.stateHash() };
+  ok('the dry town has people', before.pop > 0);
+
+  const r = sim.execCommand({ t: 'sea', level: 5 });
+  ok('raising the sea reports damage', r.ok && r.buildings > 0, JSON.stringify(r));
+  ok('drowned buildings are emptied',
+     Array.from(sim.floodedB).every((f, i) => !f || sim.occ[i] === 0));
+  ok('drowned streets are cut', r.roads > 0, String(r.roads));
+  ok('the sea changes the hash', sim.stateHash() !== before.hash);
+
+  for (let i = 0; i < 60; i++) sim.tick();
+  ok('drowned buildings do not repopulate',
+     Array.from(sim.floodedB).every((f, i) => !f || sim.occ[i] === 0));
+  ok('the town lost people to the sea', sim.stats.population < before.pop,
+     `${Math.round(sim.stats.population)} vs ${Math.round(before.pop)}`);
+
+  // routing must go AROUND the water, never through it
+  const g = sim.graph;
+  const a = g.nearestNode(w.x0 + 30, 0);
+  if (a >= 0) {
+    const dist = g.dijkstra(a);
+    let usedFlooded = false;
+    for (let e = 0; e < g.edgeCount; e++) {
+      if (sim.floodedE[e] && Number.isFinite(dist[g.eb[e]]) && g._prevEdge[g.eb[e]] === e) usedFlooded = true;
+    }
+    ok('routing never crosses flooded street', !usedFlooded);
+  }
+
+  // and the sea must round-trip through a save
+  const snap = JSON.parse(JSON.stringify(sim.snapshot()));
+  const w2 = gridTown();
+  w2.heights = hh; w2.minH = w.minH; w2.maxH = w.maxH;
+  for (const b of w2.buildings) { b.gm = w2.heightAt(b.c[0], b.c[1]); b.gx = b.gm; }
+  const sim2 = new Sim(w2, new RoadGraph(w2), { seed: 1 });
+  sim2.restore(snap);
+  ok('sea level survives a save', sim2.seaLevel === 5);
+  ok('a flooded city round-trips', sim2.stateHash() === sim.stateHash());
 }
 
 // ── palette: stable and in gamut ───────────────────────────────────────────

@@ -82,3 +82,50 @@ export function stampPoint(d, cols, rows, cell, x0, z0, x, z) {
   const gi = Math.round((x - x0) / cell), gj = Math.round((z - z0) / cell);
   if (gi >= 0 && gi < cols && gj >= 0 && gj < rows) d[gj * cols + gi] = 0;
 }
+
+/**
+ * Which cells are under water at `level`, flooding inward FROM THE MAP EDGE.
+ *
+ * ⚠️ This is a connected flood fill, not a simple `height <= level` test, and
+ * the difference is the whole point: a quarry, a sunken plaza or a dry valley
+ * floor can sit below sea level and must stay DRY unless the sea can actually
+ * reach it. Testing height alone fills inland hollows with ocean and the map
+ * immediately looks wrong to anyone who knows the place.
+ *
+ * Returns a Uint8Array mask, 1 = flooded.
+ */
+export function floodFromEdges(heights, cols, rows, level) {
+  const mask = new Uint8Array(cols * rows);
+  if (!(level > -Infinity)) return mask;
+
+  // Ring buffer queue — a plain array with shift() is O(n) per pop and this can
+  // touch every cell on a big map.
+  const queue = new Int32Array(cols * rows);
+  let head = 0, tail = 0;
+
+  // ⚠️ STRICTLY BELOW, not <=. Ground sitting exactly AT the waterline is dry
+  // land, not sea. With <=, a town whose terrain is flat at 0 m floods entirely
+  // the moment sea level is 0 — which is the default — and the whole map drowns
+  // before the player touches anything.
+  const push = k => { if (!mask[k] && heights[k] < level) { mask[k] = 1; queue[tail++] = k; } };
+
+  for (let i = 0; i < cols; i++) { push(i); push((rows - 1) * cols + i); }
+  for (let j = 0; j < rows; j++) { push(j * cols); push(j * cols + cols - 1); }
+
+  while (head < tail) {
+    const k = queue[head++];
+    const i = k % cols, j = (k / cols) | 0;
+    if (i > 0) push(k - 1);
+    if (i < cols - 1) push(k + 1);
+    if (j > 0) push(k - cols);
+    if (j < rows - 1) push(k + cols);
+  }
+  return mask;
+}
+
+/** Nearest-cell lookup into a mask. */
+export function maskAt(mask, cols, rows, cell, x0, z0, x, z) {
+  const i = Math.round((x - x0) / cell), j = Math.round((z - z0) / cell);
+  if (i < 0 || i >= cols || j < 0 || j >= rows) return 0;
+  return mask[j * cols + i];
+}
