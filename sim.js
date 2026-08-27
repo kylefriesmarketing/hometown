@@ -15,6 +15,7 @@
 import {
   TICK, ZONES, ZONE_KINDS, ZONE_INDEX, SIM, DESIRE, FALLOFF, SLOPE_HALF,
   SERVICES, REZONE_COST_PER_M2, DEMOLISH_COST_PER_M2, TRANSIT,
+  SERVICE_KINDS, SERVICE_INDEX, SERVICE_UPKEEP,
 } from './data.js';
 import { chamferFrom, sampleField, stampPoint, floodFromEdges, maskAt } from './field.js';
 
@@ -58,6 +59,7 @@ export class Sim {
     this.occ = new Float32Array(n);
     this.desire = new Float32Array(n);
     this.accessOf = new Float32Array(n);   // job access at this building, 0..1
+    this.service = new Uint8Array(n);      // what the player turned it into
 
     this._initZoning();
     this._buildFields();
@@ -143,17 +145,8 @@ export class Sim {
     }
     this.parkDist = chamferFrom(park, cols, rows, cell);
 
-    // one coverage field per service, seeded from OSM POIs
     this.serviceDist = {};
-    for (const [key, def] of Object.entries(SERVICES)) {
-      const f = new Float32Array(cols * rows).fill(BIG);
-      const want = new Set(def.poi);
-      for (const p of w.pois) {
-        if (want.has(p.k)) stampPoint(f, cols, rows, cell, x0, z0, p.x, p.z);
-      }
-      this.serviceDist[key] = chamferFrom(f, cols, rows, cell);
-    }
-
+    this._rebuildServices();
     this._rebuildNuisance();
   }
 
@@ -412,6 +405,7 @@ export class Sim {
   /** Refresh desirability and occupancy for a slice of buildings. */
   _buildingSlice() {
     if (this._nuisanceDirty) this._rebuildNuisance();
+    if (this._servicesDirty) this._rebuildServices();
 
     const per = Math.max(1, Math.ceil(this.n / SIM.buildingSliceTicks));
     const housingMul = this._housingDemand();
@@ -469,12 +463,7 @@ export class Sim {
     const slope = decay(w.slopeAt(x, zc), SLOPE_HALF);
     const park = decay(this._sample(this.parkDist, x, zc), FALLOFF.park);
 
-    let services = 0, sw = 0;
-    for (const [key, def] of Object.entries(SERVICES)) {
-      services += def.weight * decay(this._sample(this.serviceDist[key], x, zc), FALLOFF.service);
-      sw += def.weight;
-    }
-    services = sw > 0 ? services / sw : 0;
+    const services = this.serviceScoreAt(i);
 
     // nuisance is a PENALTY: 1 when far from industry, 0 right next to it
     const nuisance = this.nuisanceDist
@@ -520,6 +509,7 @@ export class Sim {
       const def = ZONES[ZONE_KINDS[z]];
       income += this.occ[i] * (def.taxPerOccupant || 0);
       upkeep += this.occ[i] * (def.upkeepPerOccupant || 0);
+      if (this.service[i]) upkeep += this.occ[i] * SERVICE_UPKEEP;
     }
     // roads cost money to keep
     let km = 0;
@@ -598,6 +588,21 @@ export class Sim {
       rt += this.zoneTransit[z] * pop; rw += pop;
     }
     for (const line of this.transit) tkm += this.graph.transitLengthOf(line) / 1000;
+    s.byService = {};
+    for (const k of SERVICE_KINDS) s.byService[k] = 0;
+    for (let i = 0; i < this.n; i++) s.byService[SERVICE_KINDS[this.service[i]]]++;
+    s.services = this.n - s.byService.none;
+
+    // population-weighted coverage: how well served the people actually are,
+    // not how many buildings happen to be schools
+    let covW = 0, covT = 0;
+    for (let i = 0; i < this.n; i++) {
+      if (this.zone[i] !== Z_RES || this.occ[i] <= 0) continue;
+      covT += this.serviceScoreAt(i) * this.occ[i];
+      covW += this.occ[i];
+    }
+    s.coverage = covW > 0 ? covT / covW : 0;
+
     s.transitShare = rw > 0 ? rt / rw : 0;
     s.transitLines = this.transit.length;
     s.transitKm = tkm;
@@ -631,6 +636,7 @@ export class Sim {
       case 'sea': return this._cmdSea(cmd);
       case 'road': return this._cmdRoad(cmd);
       case 'transit': return this._cmdTransit(cmd);
+      case 'service': return this._cmdService(cmd);
       default: return { ok: false, reason: `unknown command "${cmd.t}"` };
     }
   }
@@ -651,6 +657,9 @@ export class Sim {
     for (const i of ids) {
       if (this.zone[i] === z) continue;
       if (this.zone[i] === Z_IND || z === Z_IND) this._nuisanceDirty = true;
+      // ⚠️ Rezoning a school to housing must STOP it being a school, or its
+      // coverage would haunt the map with nothing standing there to provide it.
+      if (this.service[i]) { this.service[i] = 0; this._servicesDirty = true; }
       this.zone[i] = z;
       this.cap[i] = this._capacityOf(i, z);
       // Occupants do not survive a change of use.
@@ -671,6 +680,7 @@ export class Sim {
 
     for (const i of ids) {
       if (this.zone[i] === Z_IND) this._nuisanceDirty = true;
+      if (this.service[i]) { this.service[i] = 0; this._servicesDirty = true; }
       this.zone[i] = Z_NONE;
       this.cap[i] = 0; this.occ[i] = 0; this.desire[i] = 0;
     }
@@ -793,6 +803,87 @@ export class Sim {
     this._recomputeTotals();
   }
 
+
+  /**
+   * Coverage fields, seeded from BOTH the OSM POIs already on the map and the
+   * services the player has created. A school you place therefore serves the
+   * streets around it exactly the way a real one does — same field, same
+   * falloff, no special case.
+   */
+  _rebuildServices() {
+    const { cols, rows, cell, x0, z0 } = this._fieldDims;
+    const w = this.world;
+    const BIG = 1e6;
+
+    for (const [key, def] of Object.entries(SERVICES)) {
+      const f = new Float32Array(cols * rows).fill(BIG);
+      const want = new Set(def.poi);
+      for (const p of w.pois) {
+        if (want.has(p.k)) stampPoint(f, cols, rows, cell, x0, z0, p.x, p.z);
+      }
+      const mine = SERVICE_INDEX[key];
+      if (mine !== undefined) {
+        for (let i = 0; i < this.n; i++) {
+          if (this.service[i] !== mine) continue;
+          const c = w.buildings[i].c;
+          stampPoint(f, cols, rows, cell, x0, z0, c[0], c[1]);
+        }
+      }
+      this.serviceDist[key] = chamferFrom(f, cols, rows, cell);
+    }
+    this._servicesDirty = false;
+  }
+
+  /** How well served this building is, 0..1 — the same number the UI shows. */
+  serviceScoreAt(i) {
+    const c = this.world.buildings[i].c;
+    let total = 0, sw = 0;
+    for (const [key, def] of Object.entries(SERVICES)) {
+      total += def.weight * decay(this._sample(this.serviceDist[key], c[0], c[1]), FALLOFF.service);
+      sw += def.weight;
+    }
+    return sw > 0 ? total / sw : 0;
+  }
+
+  /**
+   * Turn buildings into services, or back into ordinary stock.
+   *
+   * A service building is zoned CIVIC, because that is what it is: it employs
+   * people, earns no tax and costs upkeep. Choosing 'none' hands it back as a
+   * vacant plot rather than guessing what it used to be.
+   */
+  _cmdService(cmd) {
+    const kind = cmd.kind ?? 'none';
+    const si = SERVICE_INDEX[kind];
+    if (si === undefined) return { ok: false, reason: 'no such service "' + kind + '"' };
+
+    const ids = (cmd.ids || []).filter(i => i >= 0 && i < this.n);
+    if (!ids.length) return { ok: false, reason: 'nothing selected' };
+
+    let cost = 0, changed = 0;
+    for (const i of ids) {
+      if (this.service[i] === si) continue;
+      cost += this.world.buildings[i].a * REZONE_COST_PER_M2;
+    }
+    if (cost > this.money) return { ok: false, reason: 'not enough money', cost };
+
+    for (const i of ids) {
+      if (this.service[i] === si) continue;
+      this.service[i] = si;
+      const z = si === SERVICE_INDEX.none ? Z_NONE : Z_CIV;
+      this.zone[i] = z;
+      this.cap[i] = this._capacityOf(i, z);
+      this.occ[i] = 0;
+      this.desire[i] = 0;
+      changed++;
+    }
+    this.money -= cost;
+    this._rebuildServices();
+    for (let i = 0; i < this.n; i++) this._updateDesire(i);
+    this._recomputeTotals();
+    return { ok: true, count: changed, cost, kind };
+  }
+
   // ── save / load / hash ───────────────────────────────────────────────────
 
   /**
@@ -815,6 +906,7 @@ export class Sim {
       zone: Array.from(this.zone),
       transit: this.transit.map(l => ({ id: l.id, kind: l.kind, stops: l.stops.map(p => [p[0], p[1]]) })),
       nextLineId: this.nextLineId,
+      service: Array.from(this.service),
       roadState: Array.from(this.roadState),
       roadLanes: Array.from(this.roadLanes),
       occ: Array.from(this.occ),
@@ -855,6 +947,7 @@ export class Sim {
     this.graph.setTransit(this.transit);
     this.floodedE = new Uint8Array(this.graph.edgeCount);
     this._nextLoad = new Float32Array(this.graph.edgeCount);
+    if (s.service) this.service.set(s.service);
     if (s.roadState) this.roadState.set(s.roadState);
     if (s.roadLanes) this.roadLanes.set(s.roadLanes);
     this._bCursor = s.bCursor | 0;
@@ -874,6 +967,7 @@ export class Sim {
     this._applyRoads();
     this._rebuildFlood();
     this._rebuildNuisance();
+    this._rebuildServices();
     this._aggregateZones();
     this._recomputeTotals();
     return this;
@@ -904,6 +998,7 @@ export class Sim {
     }
     for (let i = 0; i < this.n; i++) {
       mix(this.zone[i] * 31 + 7);
+      mix(this.service[i] * 17 + 3);
       mix(Math.round(this.occ[i] * 1000));
     }
     for (let i = 0; i < this.n; i++) mix(Math.round(this.desire[i] * 1000));

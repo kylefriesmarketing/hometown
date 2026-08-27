@@ -14,10 +14,10 @@ Two free, key-less data sources — no Google, no API key, no per-request bill:
 
 ---
 
-## Status — M5: transit (2026-08-27)
+## Status — M6: services (2026-08-27)
 
-**M1 (map) through M5 (transit) are done and verified.**
-`node test.mjs && node test-sim.mjs` = **231 tests, all green**.
+**M1 (map) through M6 (services) are done and verified.**
+`node test.mjs && node test-sim.mjs` = **253 tests, all green**.
 
 A **what-if sandbox**: no fail state, no score. You inherit a real town and you
 break it — flood it, rezone it, close streets, tear out the freeway — and watch
@@ -39,6 +39,11 @@ What works:
 - **transit**: pick bus / tram / metro, click stops along the map, press Finish.
   Lines are laid over the real street network and people use them if — and only
   if — they are actually faster
+- **services**: select buildings and make them schools, clinics, fire/police or
+  shops. A service you create seeds the same coverage field the OSM points of
+  interest already seed, so it serves its streets exactly the way a real one
+  does. Coverage is population-weighted — how well served the PEOPLE are, not
+  how many buildings are schools
 
 **Measured on San Francisco** (476k people, 470 km of streets, 291 freeway
 segments including the real Central and James Lick Freeways):
@@ -60,8 +65,8 @@ cross a metro area, and trips that leave the map cannot be modelled. (Before
 because in a sandbox with no fail state it only ever climbed and told the player
 nothing. Mean commute replaced it.
 
-Still unbuilt from the chosen direction: **transit lines**, **services**
-(coverage fields already exist, mostly UI), and **drawing new streets**.
+Still unbuilt from the chosen direction: **drawing new streets** (every existing
+street is fully editable; laying fresh ones is the remaining verb).
 
 Baked worlds:
 
@@ -272,7 +277,18 @@ Strict separation, so the sim can arrive without touching the renderer:
     access edge to another line's platform instead of to the street, and transit
     would quietly detach from the city.
 
-20. **Reload between destructive probes.** A probe that swaps a material and
+20. **A rezoned or demolished service must STOP being a service.** Otherwise its
+    coverage haunts the map with nothing standing there to provide it. Coverage
+    is also rebuilt on restore rather than carried in the save, so a loaded city
+    can never keep a field whose schools are gone. Both are tested.
+
+21. **A string-replace patch that does not match is a SILENT no-op.** The
+    coverage HUD metric shipped as a permanent "—" because its patch anchored on
+    an element removed two milestones earlier. Patch scripts assert their anchors
+    now; more importantly, verify the effect rather than trusting "patch said
+    ok".
+
+22. **Reload between destructive probes.** A probe that swaps a material and
    leaves it swapped means the next measurement is measuring the probe.
 
 ---

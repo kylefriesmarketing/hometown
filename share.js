@@ -21,12 +21,12 @@
 //     ROAD   : roadOp byte | count | (delta index) x N
 //     SEA    : zigzag(level*10)
 
-import { ZONE_KINDS, ZONE_INDEX } from './data.js';
+import { ZONE_KINDS, ZONE_INDEX, SERVICE_KINDS, SERVICE_INDEX } from './data.js';
 
 const MAGIC = [0x48, 0x54];   // 'HT'
 const VERSION = 2;
 
-const OP = { REZONE: 1, ROAD: 2, SEA: 3, TRANSIT_ADD: 4, TRANSIT_DEL: 5, TRANSIT_CLEAR: 6 };
+const OP = { REZONE: 1, ROAD: 2, SEA: 3, TRANSIT_ADD: 4, TRANSIT_DEL: 5, TRANSIT_CLEAR: 6, SERVICE: 7 };
 const ROAD_OPS = ['close', 'open', 'widen', 'narrow', 'remove'];
 const TRANSIT_KINDS = ['bus', 'tram', 'metro'];
 
@@ -134,6 +134,9 @@ export function encodeBytes(world, finalDay, log) {
       } else {
         out.push(OP.TRANSIT_CLEAR);
       }
+    } else if (cmd.t === 'service') {
+      out.push(OP.SERVICE, SERVICE_INDEX[cmd.kind] ?? 0);
+      putIds(out, cmd.ids);
     } else if (cmd.t === 'demolish') {
       // demolish is a rezone to 'none' — one opcode fewer to get wrong
       out.push(OP.REZONE, ZONE_INDEX.none);
@@ -190,6 +193,9 @@ export function decodeBytes(buf) {
       entries.push({ day, cmd: { t: 'transit', op: 'add', kind, stops } });
     } else if (op === OP.TRANSIT_DEL) {
       entries.push({ day, cmd: { t: 'transit', op: 'remove', id: getVarint(buf, cur) } });
+    } else if (op === OP.SERVICE) {
+      const k = buf[cur.i++];
+      entries.push({ day, cmd: { t: 'service', kind: SERVICE_KINDS[k] ?? 'none', ids: getIds(buf, cur) } });
     } else if (op === OP.TRANSIT_CLEAR) {
       entries.push({ day, cmd: { t: 'transit', op: 'clear' } });
     } else {

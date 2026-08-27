@@ -9,7 +9,7 @@ import { World } from './world.js';
 import { RoadGraph } from './graph.js';
 import { Sim } from './sim.js';
 import { chamfer, chamferFrom, sampleField, stampPolyline, floodFromEdges } from './field.js';
-import { ZONE_INDEX, TRANSIT, JUNCTION_DELAY } from './data.js';
+import { ZONE_INDEX, TRANSIT, JUNCTION_DELAY, SERVICE_INDEX } from './data.js';
 import { wallColour, roofColour, hash01 } from './palette.js';
 import {
   encodeBytes, decodeBytes, toBase64Url, fromBase64Url,
@@ -509,6 +509,104 @@ function gridTown({ span = 4, block = 100, pad = 0 } = {}) {
 }
 
 
+
+
+// ── services ───────────────────────────────────────────────────────────────
+{
+  const w = gridTown({ span: 8, block: 150 });
+  const sim = new Sim(w, new RoadGraph(w), { seed: 44 });
+  for (let i = 0; i < 120; i++) sim.tick();
+
+  ok('a fresh city has no player services', sim.stats.services === 0);
+  const coverBefore = sim.stats.coverage;
+
+  // put a school in the middle and one at each corner
+  const mid = w.buildings.findIndex(b => Math.hypot(b.c[0], b.c[1]) < 120);
+  ok('found a central building', mid >= 0);
+  const r = sim.execCommand({ t: 'service', ids: [mid], kind: 'education' });
+  ok('a building can become a school', r.ok && r.count === 1, JSON.stringify(r));
+  ok('it is recorded as a school', sim.service[mid] === SERVICE_INDEX.education);
+  ok('a service building is zoned civic', sim.zone[mid] === ZONE_INDEX.civic);
+  ok('a service costs money', r.cost > 0);
+
+  // ⚠️ the point of the whole feature: coverage must actually improve nearby
+  const nearby = w.buildings.findIndex((b, i) =>
+    i !== mid && Math.hypot(b.c[0] - w.buildings[mid].c[0], b.c[1] - w.buildings[mid].c[1]) < 200);
+  const scoreNear = sim.serviceScoreAt(nearby);
+  const far = w.buildings.reduce((best, b, i) => {
+    const d = Math.hypot(b.c[0] - w.buildings[mid].c[0], b.c[1] - w.buildings[mid].c[1]);
+    return d > best.d ? { i, d } : best;
+  }, { i: -1, d: -1 });
+  ok('a school serves what is near it more than what is far',
+     scoreNear > sim.serviceScoreAt(far.i),
+     `${scoreNear.toFixed(3)} vs ${sim.serviceScoreAt(far.i).toFixed(3)}`);
+
+  for (let i = 0; i < 150; i++) sim.tick();
+  ok('citywide coverage rose', sim.stats.coverage > coverBefore,
+     `${sim.stats.coverage.toFixed(4)} vs ${coverBefore.toFixed(4)}`);
+  ok('services are counted', sim.stats.services === 1 && sim.stats.byService.education === 1,
+     JSON.stringify(sim.stats.byService));
+
+  // ⚠️ rezoning a school must STOP it being a school, or coverage haunts the
+  // map with nothing standing there to provide it
+  const coverWithSchool = sim.serviceScoreAt(nearby);
+  sim.execCommand({ t: 'rezone', ids: [mid], zone: 'residential' });
+  for (let i = 0; i < 40; i++) sim.tick();
+  ok('rezoning clears the service', sim.service[mid] === 0);
+  ok('its coverage goes with it', sim.serviceScoreAt(nearby) < coverWithSchool,
+     `${sim.serviceScoreAt(nearby).toFixed(3)} vs ${coverWithSchool.toFixed(3)}`);
+
+  // and so must demolishing
+  sim.execCommand({ t: 'service', ids: [mid], kind: 'health' });
+  ok('it can become a clinic', sim.service[mid] === SERVICE_INDEX.health);
+  sim.execCommand({ t: 'demolish', ids: [mid] });
+  ok('demolishing clears the service', sim.service[mid] === 0);
+
+  ok('an unknown service is rejected',
+     sim.execCommand({ t: 'service', ids: [0], kind: 'wizardry' }).ok === false);
+  ok('an empty selection is rejected',
+     sim.execCommand({ t: 'service', ids: [], kind: 'education' }).ok === false);
+  ok('setting it back to none works',
+     sim.execCommand({ t: 'service', ids: [1], kind: 'education' }).ok &&
+     sim.execCommand({ t: 'service', ids: [1], kind: 'none' }).ok &&
+     sim.service[1] === 0);
+}
+
+// services must be deterministic, saved and hashed
+{
+  const mk = () => {
+    const w = gridTown({ span: 8, block: 150 });
+    return new Sim(w, new RoadGraph(w), { seed: 52 });
+  };
+  const a = mk(), b = mk();
+  for (const s of [a, b]) {
+    for (let i = 0; i < 50; i++) s.tick();
+    s.execCommand({ t: 'service', ids: [4, 9, 14], kind: 'education' });
+    s.execCommand({ t: 'service', ids: [20], kind: 'safety' });
+    for (let i = 0; i < 60; i++) s.tick();
+  }
+  ok('services are deterministic', a.stateHash() === b.stateHash(),
+     `${a.stateHash()} vs ${b.stateHash()}`);
+
+  const plain = mk();
+  for (let i = 0; i < 110; i++) plain.tick();
+  ok('a service changes the hash', a.stateHash() !== plain.stateHash());
+
+  const snap = JSON.parse(JSON.stringify(a.snapshot()));
+  const c = mk();
+  c.restore(snap);
+  ok('services survive a save', c.service[4] === SERVICE_INDEX.education
+     && c.service[20] === SERVICE_INDEX.safety);
+  ok('a city with services round-trips', c.stateHash() === a.stateHash(),
+     `${c.stateHash()} vs ${a.stateHash()}`);
+  // ⚠️ coverage is REBUILT on restore, not carried; if it were not, a loaded
+  // city would keep the field while the schools were gone
+  ok('restore rebuilt the coverage field',
+     near(c.serviceScoreAt(5), a.serviceScoreAt(5), 1e-6),
+     `${c.serviceScoreAt(5)} vs ${a.serviceScoreAt(5)}`);
+  for (let i = 0; i < 40; i++) { a.tick(); c.tick(); }
+  ok('a restored city with services stays in step', c.stateHash() === a.stateHash());
+}
 
 // ── transit ────────────────────────────────────────────────────────────────
 

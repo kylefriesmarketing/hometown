@@ -217,6 +217,20 @@ export const SERVICES = {
   shops:     { label: 'Shops',   icon: '🛒', poi: ['shop', 'food'], weight: 0.7 },
 };
 
+// ─── player-placed services ─────────────────────────────────────────────────
+//
+// You inherit a real town, so the verb is "make THIS building a school", not
+// "plop a school". Every service seeds the same coverage field the OSM POIs
+// seed, which means a school you place serves the streets around it exactly the
+// way a real one already on the map does.
+//
+// Order is the wire format: `service` is stored as an index, so APPEND ONLY.
+export const SERVICE_KINDS = ['none', 'education', 'health', 'safety', 'shops'];
+export const SERVICE_INDEX = Object.fromEntries(SERVICE_KINDS.map((k, i) => [k, i]));
+
+/** Per-occupant monthly cost of running one. Services cost, they do not earn. */
+export const SERVICE_UPKEEP = 1.4;
+
 // ─── overlays ───────────────────────────────────────────────────────────────
 
 export const OVERLAYS = {
@@ -226,4 +240,5 @@ export const OVERLAYS = {
   desire:     { label: 'Desirability', hint: 'where people want to be' },
   access:     { label: 'Job access', hint: 'jobs reachable by road' },
   congestion: { label: 'Congestion', hint: 'traffic against road capacity' },
+  services:   { label: 'Services', hint: 'how well schools, health and safety reach' },
 };

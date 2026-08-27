@@ -4,7 +4,7 @@
 // It never writes sim state directly — every mutation goes through
 // `sim.execCommand`, which is what keeps a city reproducible.
 
-import { TICK, ZONES, ZONE_KINDS, ZONE_INDEX, OVERLAYS, REZONE_COST_PER_M2, TRANSIT } from './data.js';
+import { TICK, ZONES, ZONE_KINDS, ZONE_INDEX, OVERLAYS, REZONE_COST_PER_M2, TRANSIT, SERVICES, SERVICE_KINDS, SERVICE_INDEX } from './data.js';
 import { encode as encodeShare, CommandLog } from './share.js';
 
 const $ = id => document.getElementById(id);
@@ -35,6 +35,11 @@ const OVERLAY_DATA = {
   access: {
     valueAt: (sim, i) => sim.zone[i] === ZONE_INDEX.none ? null : Math.min(1, sim.accessOf[i] * 3),
     legend: ['cut off', 'reaches the jobs'],
+  },
+  services: {
+    valueAt: (sim, i) => sim.zone[i] === ZONE_INDEX.none && !sim.service[i]
+      ? null : sim.serviceScoreAt(i),
+    legend: ['no services near', 'well served'],
   },
   congestion: {
     valueAt: (sim, i) => {
@@ -80,6 +85,7 @@ export class Game {
     this._buildSeaSlider();
     this._buildOverlays();
     this._buildZoneButtons();
+    this._buildServiceButtons();
     this._buildRoadButtons();
     this._buildShare();
     this._buildTransitButtons();
@@ -170,6 +176,15 @@ export class Game {
     // ⚠️ The treasury used to live here and it was noise: in a sandbox with no
     // fail state it only ever climbs, so it told the player nothing. The mean
     // commute is the number that actually responds to what they do to the city.
+    const cv = $('m-coverage');
+    if (cv) {
+      const c = sim.stats.coverage || 0;
+      cv.textContent = (c * 100).toFixed(0) + '%';
+      cv.className = 'v' + (c < 0.25 ? ' bad' : c > 0.6 ? ' good' : '');
+      const n = sim.stats.services || 0;
+      cv.title = `${n} building${n === 1 ? '' : 's'} run services`;
+    }
+
     const cm = $('m-commute');
     const mins = sim.stats.commute;
     cm.textContent = mins > 0 ? mins.toFixed(1) + ' min' : '—';
@@ -501,6 +516,32 @@ export class Game {
       : `click a street to select it · shift-click to add${suffix}`;
   }
 
+
+  _buildServiceButtons() {
+    const row = $('service-row');
+    if (!row) return;
+    row.innerHTML = '';
+    for (const [key, def] of Object.entries(SERVICES)) {
+      const b = document.createElement('button');
+      b.textContent = `${def.icon} ${def.label}`;
+      b.title = `Turn the selected buildings into ${def.label.toLowerCase()}`;
+      b.addEventListener('click', () => this.makeService(key));
+      row.appendChild(b);
+    }
+  }
+
+  makeService(kind) {
+    if (!this.selection.size) return this.toast('Select a building first', true);
+    const r = this.issue({ t: 'service', ids: [...this.selection], kind });
+    if (!r.ok) {
+      return this.toast(r.reason === 'not enough money'
+        ? `Not enough money — that costs ${money(r.cost)}` : r.reason, true);
+    }
+    const label = SERVICES[kind] ? SERVICES[kind].label.toLowerCase() : kind;
+    this.toast(`${r.count} building${r.count === 1 ? '' : 's'} now ${label} · ${money(r.cost)}`);
+    this.afterCommand();
+  }
+
   // ── selection & commands ─────────────────────────────────────────────────
 
   _buildZoneButtons() {
@@ -547,8 +588,17 @@ export class Game {
       occ += this.sim.occ[i]; cap += this.sim.cap[i];
     }
     const cost = area * REZONE_COST_PER_M2;
+    const svc = {};
+    for (const i of this.selection) {
+      const k = SERVICE_KINDS[this.sim.service[i]];
+      if (k !== 'none') svc[k] = (svc[k] || 0) + 1;
+    }
+    const svcLabel = Object.keys(svc).length
+      ? ' · ' + Object.entries(svc).map(([k, c]) =>
+          `${c}× ${SERVICES[k] ? SERVICES[k].icon : ''}${SERVICES[k] ? SERVICES[k].label : k}`).join(', ')
+      : '';
     info.innerHTML = `<b>${n}</b> selected · ${fmt(area)} m² · ` +
-      `${fmt(occ)}/${fmt(cap)} occupied · rezone costs <b>${money(cost)}</b>`;
+      `${fmt(occ)}/${fmt(cap)} occupied${svcLabel} · rezone costs <b>${money(cost)}</b>`;
   }
 
   rezone(kind) {
