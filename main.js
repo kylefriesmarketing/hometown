@@ -59,7 +59,17 @@ async function loadWorld(name) {
   // the play layer
   sim = new Sim(world, graph, { seed: 20260825 });
   game = new Game(sim, view, ui);
+
+  // ⚠️ THE BAY. The flood mask already marks everything below sea level from
+  // tick zero — 863 cells of San Francisco bay — but the water mesh was only
+  // ever built when the player touched the sea slider. Until they did, the bay
+  // was painted as flat grey "wet ground" with no water surface on it at all,
+  // which was most of what read as dead grey space.
+  view.buildWater(sim.floodMask, sim.seaLevel);
+  view.setSeaLevel(sim.seaLevel);
+
   console.log('[hometown] street graph', graph.stats());
+  console.log('[hometown] surround', view.surround.stats());
 
   // A shared city arrives as a diff in the URL hash and is replayed through
   // COMMANDS, so it can only reach a state a player could have reached.

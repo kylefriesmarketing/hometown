@@ -166,6 +166,7 @@ export class Game {
     const r = silent ? this.sim.execCommand({ t: 'sea', level }) : this.issue({ t: 'sea', level });
     if (!r.ok) return;
     const cells = this.view.buildWater(this.sim.floodMask, level);
+    this.view.setSeaLevel(level);
     $('sea-value').textContent = (level >= 0 ? '+' : '') + level.toFixed(1) + ' m';
     const f = this.sim.floodStats;
     $('sea-info').innerHTML = level === 0 && !f.buildings

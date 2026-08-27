@@ -16,6 +16,7 @@ import {
 } from './palette.js';
 import { TRANSIT } from './data.js';
 import { Traffic } from './traffic.js';
+import { Surround, HORIZON } from './surround.js';
 
 // Vertical layering — small, fixed offsets so draped surfaces never z-fight.
 // ⚠️ `foot` sits BELOW `road` on purpose. A well-mapped city tags every
@@ -74,9 +75,26 @@ export class View {
     this.renderer.toneMappingExposure = 1.18;
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.Fog(SKY.fog, world.width * 0.9, world.width * 2.6);
+    // ⚠️ EXPONENTIAL, not linear. Linear fog has a hard end: past `far`
+    // everything is exactly fog colour, so the apron's outer boundary shows as
+    // a faint but findable line. FogExp2 never fully saturates, so the land
+    // just keeps receding. Density scales with world size so a small map and a
+    // big one haze at the same apparent rate.
+    // ⚠️ MEASURED, not guessed. FogExp2 is exp(-(density*distance)^2), which
+    // bites much harder than it looks: at 1.15/width the haze was 0.34 at one
+    // kilometre and 0.81 at two, so the CITY washed out rather than the horizon.
+    // At 0.55/width it is 0.09 at 1 km, 0.31 at 2 km and 0.78 at 4 km — the
+    // town stays legible and only the apron dissolves.
+    this.scene.fog = new THREE.FogExp2(SKY.fog, 0.55 / world.width);
+    // Everything past the tile is sized off ONE reference distance so the
+    // ordering apron < sea < dome < far can never drift. See surround.js.
+    this._horizon = world.width * HORIZON;
 
-    this.camera = new THREE.PerspectiveCamera(46, 1, 1, world.width * 4);
+    // Far plane must contain the apron. Near pulled off 1 m as well: depth
+    // precision across this range matters more than standing on a kerb.
+    // near is 5 rather than 1: depth precision across a horizon this deep
+    // matters far more than being able to stand on a kerb.
+    this.camera = new THREE.PerspectiveCamera(46, 1, 5, world.width * HORIZON * 2.2);
 
     this.cam = {
       fx: 0, fz: 0,
@@ -87,6 +105,7 @@ export class View {
     this.cam.fy = world.heightAt(0, 0);
 
     this.traffic = null;
+    this.surround = null;   // everything past the edge of the baked tile
     this.lifeOf = null;     // i -> 0..1 occupancy, set by the game layer
 
     this._sky();
@@ -99,7 +118,11 @@ export class View {
 
   /** Gradient dome. A flat background colour is the flattest thing in a scene. */
   _sky() {
-    const geo = new THREE.SphereGeometry(this.world.width * 1.8, 24, 16);
+    // Comfortably outside the camera's far plane and the sea plane, so the
+    // horizon is always dome and never the cut edge of geometry.
+    // Outside the sea, inside the far plane: the horizon is always dome, never
+    // the cut edge of geometry.
+    const geo = new THREE.SphereGeometry(this.world.width * HORIZON * 1.6, 32, 20);
     const mat = new THREE.ShaderMaterial({
       side: THREE.BackSide, depthWrite: false, fog: false,
       uniforms: {
@@ -189,6 +212,10 @@ export class View {
 
   build() {
     const t0 = performance.now();
+    // ⚠️ The surround goes down FIRST so the real tile draws over it rather
+    // than the other way round, and so a low camera never catches the sea
+    // plane fighting with the terrain it is meant to sit under.
+    this.surround = new Surround(this.world, this.scene).build(0);
     this.buildTerrain();
     this.buildAreas();
     this.buildRoads();
@@ -587,6 +614,9 @@ export class View {
    * that merely happens to sit below sea level, and anyone who knows the place
    * would spot it instantly.
    */
+  /** Raise or lower the open sea beyond the map along with the flood. */
+  setSeaLevel(level) { this.surround?.setSeaLevel(level); }
+
   buildWater(mask, level) {
     if (this.water) {
       this.scene.remove(this.water);

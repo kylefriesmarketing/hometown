@@ -80,7 +80,14 @@ export const GROUND = {
 export const SKY = {
   top:     0x4d86c4,
   horizon: 0xd6e2ec,
-  ground:  0x9aa3a8,
+  /**
+   * ⚠️ The dome's BELOW-horizon colour. It used to be a flat grey (0x9aa3a8)
+   * and that grey WAS the "empty space" past the edge of the map — with a
+   * finite tile floating in it, the dome underneath is simply what you saw.
+   * The surround now covers it, but it is matched to the fog anyway so that if
+   * a sliver ever shows it is indistinguishable from haze rather than a void.
+   */
+  ground:  0xc2d2e0,
   fog:     0xc6d5e2,
 };
 
