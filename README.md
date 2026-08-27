@@ -14,10 +14,10 @@ Two free, key-less data sources — no Google, no API key, no per-request bill:
 
 ---
 
-## Status — M3: street surgery (2026-08-25)
+## Status — M4: share links (2026-08-27)
 
-**M1 (map), M2 (sim) and M3 (streets) are done and verified.**
-`node test.mjs && node test-sim.mjs` = **172 tests, all green**.
+**M1 (map), M2 (sim), M3 (streets) and M4 (sharing) are done and verified.**
+`node test.mjs && node test-sim.mjs` = **197 tests, all green**.
 
 A **what-if sandbox**: no fail state, no score. You inherit a real town and you
 break it — flood it, rezone it, close streets, tear out the freeway — and watch
@@ -31,6 +31,11 @@ What works:
 - **street surgery**: click any street to close, reopen, widen, narrow or tear
   it out. One button selects every motorway and trunk road on the map
 - five overlays, click-to-rezone, demolish, speed controls, live HUD
+- **share links**: 🔗 Copy link puts your whole city in a URL. A Russian Hill
+  with its freeways torn out, three blocks rezoned and 3.5 m of sea is a
+  **97-character URL** — and it reproduces byte-identically (verified: same
+  `stateHash` on both sides, not merely a similar-looking city)
+- **hold ⟨C⟩ or the 👁 button** to see the real town underneath your changes
 
 **Measured on San Francisco** (476k people, 470 km of streets, 291 freeway
 segments including the real Central and James Lick Freeways):
@@ -53,8 +58,7 @@ because in a sandbox with no fail state it only ever climbed and told the player
 nothing. Mean commute replaced it.
 
 Still unbuilt from the chosen direction: **transit lines**, **services**
-(coverage fields already exist, mostly UI), **drawing new streets**, and the
-**before/after slider + share link**.
+(coverage fields already exist, mostly UI), and **drawing new streets**.
 
 Baked worlds:
 
@@ -115,7 +119,8 @@ Strict separation, so the sim can arrive without touching the renderer:
 | `sim.js` | the deterministic city simulation | **no `Math.random`, no DOM, no Date.** `execCommand` is the only mutation path |
 | `data.js` | ALL tuning | balance changes go here and nowhere else |
 | `palette.js` | how the city is coloured | pure data |
-| `game.js` | play layer: HUD, overlays, selection, clock | issues commands; never writes sim state |
+| `share.js` | the command log, and city↔URL | pure; the log IS the share link |
+| `game.js` | play layer: HUD, overlays, selection, clock | `issue()` is the ONLY route to the sim |
 | `main.js` | boot, input, frame loop | — |
 | `tools/bake.mjs` | the pipeline | bake-time only |
 | `tools/osm.js` | OSM tags → game features | bake-time only; the runtime never sees a raw tag |
@@ -203,7 +208,24 @@ Strict separation, so the sim can arrive without touching the renderer:
     5.1 ms frame when warm it is 1.15 → 0.86 ms. Real cost at 1920x1080 while
     panning is **1 ms/frame**, 2M triangles, 17 draw calls.
 
-14. **Reload between destructive probes.** A probe that swaps a material and
+14. **A share link is a LOG, not a diff — and that is the whole feature.** The
+    first version encoded the final state and replayed it by applying every edit
+    at day 0. The result was *nearly* the author's city — population within
+    0.01% — but not it: they had torn out the freeways at day 150, not day 0,
+    and the city had grown differently since. Day-stamping every command makes
+    it a genuine replay. `test-sim.mjs` asserts BOTH that a replay matches and
+    that replaying the same edits at the wrong time does NOT, so the test cannot
+    pass trivially.
+
+15. **`game.issue()` is the only route to `sim.execCommand`.** Anything that
+    bypasses it is a change that silently will not travel in a share link.
+
+16. **State before UI builders in the Game constructor.** `_buildSeaSlider()`
+    primes the slider, which routes through `issue()`, which needs the log —
+    creating the log after the builders threw on construction and the game never
+    booted at all. Same class as a TDZ trap: armed by content, not by syntax.
+
+17. **Reload between destructive probes.** A probe that swaps a material and
    leaves it swapped means the next measurement is measuring the probe.
 
 ---

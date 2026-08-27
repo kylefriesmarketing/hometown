@@ -66,6 +66,24 @@
     border-radius: 4px; padding: 0 4px; font: 11px ui-monospace, monospace;
   }
 
+  /* ── share ────────────────────────────────────────────────────── */
+  #share { top: 14px; right: 190px; display: flex; gap: 6px; padding: 8px 10px; }
+  #share button {
+    padding: 6px 11px; border-radius: 7px; cursor: pointer; white-space: nowrap;
+    background: rgba(255,255,255,.08); color: var(--text);
+    border: 1px solid var(--panel-line); font: inherit; font-size: 12.5px;
+  }
+  #share button:hover { background: rgba(255,255,255,.16); }
+  #share button.on { background: var(--warn); color: #17202a; border-color: var(--warn); font-weight: 650; }
+
+  #compare-tag {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    font-size: 26px; letter-spacing: 5px; font-weight: 300; pointer-events: none;
+    color: rgba(255,255,255,.85); text-shadow: 0 2px 16px rgba(0,0,0,.8);
+    opacity: 0; transition: opacity .18s;
+  }
+  #compare-tag.on { opacity: 1; }
+
   /* ── attribution: required by ODbL, and simply correct ───────── */
   #attrib {
     position: absolute; bottom: 6px; right: 10px; font-size: 10.5px;
@@ -210,7 +228,14 @@
     </div>
   </div>
 
+  <div class="panel" id="share">
+    <button id="share-btn" title="Copy a link to this city">🔗 Copy link</button>
+    <button id="compare-btn" title="Hold to see the real town (or hold C)">👁 Before</button>
+  </div>
+
   <div id="toast"></div>
+
+  <div id="compare-tag">THE REAL TOWN</div>
 
   <div id="attrib">
     map data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors ·

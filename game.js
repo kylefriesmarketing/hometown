@@ -5,6 +5,7 @@
 // `sim.execCommand`, which is what keeps a city reproducible.
 
 import { TICK, ZONES, ZONE_KINDS, ZONE_INDEX, OVERLAYS, REZONE_COST_PER_M2 } from './data.js';
+import { encode as encodeShare, CommandLog } from './share.js';
 
 const $ = id => document.getElementById(id);
 const fmt = n => Math.round(n).toLocaleString();
@@ -63,11 +64,23 @@ export class Game {
     this.overlay = 'none';
     this._hudT = 0;
 
+    // ⚠️ STATE BEFORE BUILDERS. _buildSeaSlider() calls setSea(0), which routes
+    // through issue(), which needs the log — creating the log afterwards threw
+    // on construction and the game never booted. Anything a UI builder can reach
+    // must already exist here.
+    // Every command the player issues, day-stamped. This IS the share link.
+    this.log = new CommandLog();
+    // What the town looked like before this player touched it — the reference
+    // for the before/after comparison.
+    this.baseline = { zone: Uint8Array.from(sim.zone) };
+    this.comparing = false;
+
     this._buildSpeeds();
     this._buildSeaSlider();
     this._buildOverlays();
     this._buildZoneButtons();
     this._buildRoadButtons();
+    this._buildShare();
     this.refreshHud();
     this.refreshRoads();
     this.applyOverlay('none');
@@ -114,11 +127,13 @@ export class Game {
     const el = $('sea-slider');
     if (!el) return;
     el.addEventListener('input', () => this.setSea(+el.value / 10));
-    this.setSea(0);
+    // Priming the slider is not a player edit, so it must not enter the log —
+    // otherwise every share link opens with a redundant "set sea to 0".
+    this.setSea(0, { silent: true });
   }
 
-  setSea(level) {
-    const r = this.sim.execCommand({ t: 'sea', level });
+  setSea(level, { silent = false } = {}) {
+    const r = silent ? this.sim.execCommand({ t: 'sea', level }) : this.issue({ t: 'sea', level });
     if (!r.ok) return;
     const cells = this.view.buildWater(this.sim.floodMask, level);
     $('sea-value').textContent = (level >= 0 ? '+' : '') + level.toFixed(1) + ' m';
@@ -216,6 +231,97 @@ export class Game {
   }
 
 
+
+
+  /**
+   * The ONE place a player command reaches the sim.
+   *
+   * ⚠️ Nothing else may call sim.execCommand. Routing everything through here is
+   * what keeps the command log complete, and the log is what the share link is —
+   * a command that skips this funnel is a change that silently will not travel.
+   */
+  issue(cmd) {
+    const r = this.sim.execCommand(cmd);
+    if (r && r.ok) this.log.record(this.sim.day, cmd);
+    return r;
+  }
+
+  // ── share & compare ──────────────────────────────────────────────────────
+
+  _buildShare() {
+    const s = $('share-btn'), c = $('compare-btn');
+    if (s) s.addEventListener('click', () => this.copyLink());
+    if (!c) return;
+    // hold, do not toggle — a comparison you have to keep holding is one you
+    // actually flick back and forth, which is the whole point
+    const on = e => { e.preventDefault(); this.setCompare(true); };
+    const off = () => this.setCompare(false);
+    c.addEventListener('pointerdown', on);
+    c.addEventListener('pointerup', off);
+    c.addEventListener('pointerleave', off);
+  }
+
+  async copyLink() {
+    try {
+      const code = await encodeShare(this.sim.world, this.sim.day, this.log);
+      const url = `${location.origin}${location.pathname}?world=${encodeURIComponent(this.sim.world.name)}#s=${code}`;
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(url);
+        copied = true;
+      } catch { /* clipboard is blocked in some contexts — fall through */ }
+      // Always put it in the address bar too, so the link is recoverable even
+      // when the clipboard is refused.
+      history.replaceState(null, '', url);
+      this.toast(copied
+        ? `Link copied — ${this.log.length} change${this.log.length === 1 ? '' : 's'}, ${code.length} characters`
+        : 'Link is in the address bar (clipboard was blocked)');
+      return url;
+    } catch (e) {
+      this.toast('Could not build a link: ' + e.message, true);
+      return null;
+    }
+  }
+
+  /**
+   * Show the town as it really is, without this player's edits.
+   * Nothing in the SIM changes — only what is painted — so letting go puts the
+   * real city straight back without re-running anything.
+   */
+  setCompare(on) {
+    if (on === this.comparing) return;
+    this.comparing = on;
+    $('compare-btn')?.classList.toggle('on', on);
+    $('compare-tag')?.classList.toggle('on', on);
+
+    if (on) {
+      this._savedOverlay = this.overlay;
+      this.view.paintRoads(null, null, null);            // every street as built
+      if (this.view.water) this.view.water.visible = false;
+
+      // Reuse the overlay machinery, but read the BASELINE zoning rather than
+      // the live sim. On the zoning overlay that is the whole comparison; on the
+      // others the honest answer is that they describe a simulated present with
+      // no "before", so fall back to natural colours.
+      if (this._savedOverlay === 'zone') {
+        const base = this.baseline.zone;
+        this.view.setOverlay('zone', {
+          valueAt: i => base[i] === ZONE_INDEX.none ? null : base[i],
+          hueFor: () => 0,
+          colourAt: i => base[i] === ZONE_INDEX.none
+            ? null : ZONES[ZONE_KINDS[base[i]]].colour,
+        });
+      } else {
+        this.view.setOverlay('none', null);
+      }
+    } else {
+      if (this.view.water) this.view.water.visible = true;
+      this.refreshRoads();
+      this.applyOverlay(this._savedOverlay ?? 'none');
+    }
+    this.view.invalidateShadows();
+  }
+
   // ── streets ──────────────────────────────────────────────────────────────
 
   _buildRoadButtons() {
@@ -263,7 +369,7 @@ export class Game {
 
   roadOp(op) {
     if (!this.roadSel.size) return this.toast('Select a street first', true);
-    const r = this.sim.execCommand({ t: 'road', ids: [...this.roadSel], op });
+    const r = this.issue({ t: 'road', ids: [...this.roadSel], op });
     if (!r.ok) return this.toast(r.reason, true);
     const verb = { close: 'closed', open: 'reopened', widen: 'widened',
                    narrow: 'narrowed', remove: 'torn out' }[op] || op;
@@ -340,7 +446,7 @@ export class Game {
 
   rezone(kind) {
     if (!this.selection.size) return this.toast('Select a building first', true);
-    const r = this.sim.execCommand({ t: 'rezone', ids: [...this.selection], zone: kind });
+    const r = this.issue({ t: 'rezone', ids: [...this.selection], zone: kind });
     if (!r.ok) return this.toast(r.reason === 'not enough money'
       ? `Not enough money — that costs ${money(r.cost)}` : r.reason, true);
     this.toast(`${r.count} building${r.count === 1 ? '' : 's'} rezoned to ${ZONES[kind].label} · ${money(r.cost)}`);
@@ -349,7 +455,7 @@ export class Game {
 
   demolish() {
     if (!this.selection.size) return this.toast('Select a building first', true);
-    const r = this.sim.execCommand({ t: 'demolish', ids: [...this.selection] });
+    const r = this.issue({ t: 'demolish', ids: [...this.selection] });
     if (!r.ok) return this.toast(r.reason, true);
     this.toast(`${r.count} plot${r.count === 1 ? '' : 's'} cleared · ${money(r.cost)}`);
     this.afterCommand();

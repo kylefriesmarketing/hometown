@@ -11,6 +11,10 @@ import { Sim } from './sim.js';
 import { chamfer, chamferFrom, sampleField, stampPolyline, floodFromEdges } from './field.js';
 import { ZONE_INDEX } from './data.js';
 import { wallColour, roofColour, hash01 } from './palette.js';
+import {
+  encodeBytes, decodeBytes, toBase64Url, fromBase64Url,
+  applyShare, CommandLog, MAX_REPLAY_DAYS, MAX_ENTRIES,
+} from './share.js';
 
 let pass = 0, fail = 0;
 const fails = [];
@@ -502,6 +506,158 @@ function gridTown({ span = 4, block = 100, pad = 0 } = {}) {
 
   for (let i = 0; i < 40; i++) { sim.tick(); sim2.tick(); }
   ok('a city with edited streets stays in step', sim.stateHash() === sim2.stateHash());
+}
+
+
+// ── share codes ────────────────────────────────────────────────────────────
+
+// base64url must survive every byte, including the ones that need escaping
+{
+  const bytes = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) bytes[i] = i;
+  const round = fromBase64Url(toBase64Url(bytes));
+  ok('base64url round-trips all 256 byte values',
+     round.length === 256 && Array.from(round).every((v, i) => v === i));
+  ok('base64url is URL-safe', !/[+/=]/.test(toBase64Url(bytes)));
+}
+
+// the binary payload
+{
+  const w = gridTown();
+  const log = new CommandLog();
+  const empty = decodeBytes(encodeBytes(w, 0, log));
+  ok('an untouched city encodes cleanly',
+     empty.world === 'grid' && empty.entries.length === 0 && empty.finalDay === 0);
+
+  log.record(10, { t: 'rezone', zone: 'industrial', ids: [0, 1, 5] });
+  log.record(40, { t: 'road', op: 'remove', ids: [2, 3, 4] });
+  log.record(55, { t: 'sea', level: -2.5 });
+  log.record(70, { t: 'demolish', ids: [9] });
+
+  const d = decodeBytes(encodeBytes(w, 90, log));
+  ok('finalDay survives', d.finalDay === 90);
+  ok('every entry survives', d.entries.length === 4, String(d.entries.length));
+  ok('day stamps survive', d.entries.map(e => e.day).join() === '10,40,55,70',
+     d.entries.map(e => e.day).join());
+  ok('a rezone survives', d.entries[0].cmd.t === 'rezone'
+     && d.entries[0].cmd.zone === 'industrial'
+     && d.entries[0].cmd.ids.join() === '0,1,5');
+  ok('a road op survives', d.entries[1].cmd.t === 'road' && d.entries[1].cmd.op === 'remove');
+  ok('a NEGATIVE sea level survives', near(d.entries[2].cmd.level, -2.5, 1e-9),
+     String(d.entries[2].cmd.level));
+  ok('demolish becomes a rezone to none',
+     d.entries[3].cmd.t === 'rezone' && d.entries[3].cmd.zone === 'none');
+
+  // entries past finalDay are dropped rather than carried
+  const trimmed = decodeBytes(encodeBytes(w, 45, log));
+  ok('entries after finalDay are dropped', trimmed.entries.length === 2,
+     String(trimmed.entries.length));
+
+  // corrupt codes must be refused, not silently misread
+  ok('a bad magic is refused', (() => {
+    try { decodeBytes(new Uint8Array([1, 2, 3, 4])); return false; } catch { return true; }
+  })());
+  ok('a truncated code is refused', (() => {
+    const b = encodeBytes(w, 90, log);
+    try { decodeBytes(b.subarray(0, 6)); return false; } catch { return true; }
+  })());
+  ok('a future version is refused', (() => {
+    const b = encodeBytes(w, 90, log);
+    b[2] = 99;
+    try { decodeBytes(b); return false; } catch { return true; }
+  })());
+  ok('an unknown opcode is refused', (() => {
+    const b = Array.from(encodeBytes(w, 90, log));
+    // first entry opcode sits right after the day delta
+    const i = b.findIndex((v, k) => k > 8 && v === 1);
+    if (i < 0) return true;
+    b[i] = 77;
+    try { decodeBytes(Uint8Array.from(b)); return false; } catch { return true; }
+  })());
+}
+
+// ⚠️⚠️ THE CONTRACT: a shared city must BE the city that was shared — including
+// WHEN each edit happened. The first version encoded only the final state and
+// replayed it from day 0; the result was within 0.01% and still wrong.
+{
+  const mk = () => { const w = gridTown(); return new Sim(w, new RoadGraph(w), { seed: 7 }); };
+
+  const author = mk();
+  const log = new CommandLog();
+  const issue = cmd => { const r = author.execCommand(cmd); if (r.ok) log.record(author.day, cmd); return r; };
+
+  const distinct = [...new Set(Array.from(author.graph.eroad))];
+  for (let i = 0; i < 60; i++) author.tick();
+  issue({ t: 'rezone', ids: [0, 1, 5, 9], zone: 'industrial' });
+  for (let i = 0; i < 45; i++) author.tick();
+  issue({ t: 'road', ids: [distinct[0], distinct[1]], op: 'remove' });
+  issue({ t: 'sea', level: 1.5 });
+  for (let i = 0; i < 70; i++) author.tick();
+  issue({ t: 'rezone', ids: [2, 3], zone: 'civic' });
+  for (let i = 0; i < 30; i++) author.tick();
+
+  const share = decodeBytes(encodeBytes(author.world, author.day, log));
+  const guest = mk();
+  const res = applyShare(guest, share);
+
+  ok('every command replayed', res.skipped === 0, JSON.stringify(res));
+  ok('the guest reached the same day', res.daysReplayed === author.day,
+     `${res.daysReplayed} vs ${author.day}`);
+  ok('a shared city IS the shared city', guest.stateHash() === author.stateHash(),
+     `${guest.stateHash()} vs ${author.stateHash()}`);
+
+  for (let i = 0; i < 40; i++) { author.tick(); guest.tick(); }
+  ok('a shared city stays in step', guest.stateHash() === author.stateHash());
+
+  // and the same edits applied at the WRONG time must NOT match — otherwise the
+  // test above would pass even with the bug it exists to catch
+  const authorAtShare = guest.stateHash();   // both already advanced 40 more days
+  const naive = mk();
+  for (const e of share.entries) naive.execCommand(e.cmd);   // ALL at day 0
+  while (naive.day < author.day) naive.tick();
+  ok('replaying edits at the wrong time gives a DIFFERENT city',
+     naive.stateHash() !== authorAtShare,
+     'day stamps are what make a share exact — if this passes trivially the test is dead');
+}
+
+// a hostile or stale code must not crash the game
+{
+  const w = gridTown();
+  const sim = new Sim(w, new RoadGraph(w), { seed: 3 });
+  const evil = {
+    world: 'grid', finalDay: 5,
+    entries: [
+      { day: 1, cmd: { t: 'rezone', zone: 'industrial', ids: [-5, 999999] } },
+      { day: 2, cmd: { t: 'road', op: 'close', ids: [999999] } },
+      { day: 3, cmd: { t: 'sea', level: 2 } },
+    ],
+  };
+  let threw = false, res;
+  try { res = applyShare(sim, evil); } catch { threw = true; }
+  ok('a malformed share does not throw', !threw);
+  ok('out-of-range commands are rejected by the sim', res && res.skipped >= 2,
+     JSON.stringify(res));
+
+  const huge = { world: 'grid', finalDay: 99999999, entries: [] };
+  const r2 = applyShare(new Sim(gridTown(), new RoadGraph(gridTown()), { seed: 3 }), huge);
+  ok('an absurd day count is capped',
+     r2.daysReplayed === MAX_REPLAY_DAYS && r2.dayCapped, JSON.stringify(r2));
+
+  ok('the log refuses to grow without bound', (() => {
+    const l = new CommandLog();
+    for (let i = 0; i < MAX_ENTRIES + 50; i++) l.record(i, { t: 'sea', level: 0 });
+    return l.length === MAX_ENTRIES;
+  })());
+}
+
+// the whole point: a big city fits in a link
+{
+  const w = gridTown({ span: 6, block: 120 });
+  const log = new CommandLog();
+  log.record(100, { t: 'road', op: 'remove', ids: w.roads.map((_, i) => i) });
+  const bytes = encodeBytes(w, 200, log);
+  ok('tearing out every street stays small', bytes.length < 300,
+     `${bytes.length} bytes for ${w.roads.length} streets`);
 }
 
 // ── palette: stable and in gamut ───────────────────────────────────────────

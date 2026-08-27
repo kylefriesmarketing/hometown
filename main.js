@@ -6,12 +6,14 @@ import { UI } from './ui.js';
 import { RoadGraph } from './graph.js';
 import { Sim } from './sim.js';
 import { Game } from './game.js';
+import { decode as decodeShare, applyShare } from './share.js';
 
 const canvas = document.getElementById('c');
 const bootEl = document.getElementById('boot');
 const bootMsg = document.getElementById('boot-msg');
 
 let world = null, view = null, ui = null, graph = null, sim = null, game = null;
+let pendingShare = null;
 const keys = Object.create(null);
 
 // ─── boot ─────────────────────────────────────────────────────────────────
@@ -55,6 +57,36 @@ async function loadWorld(name) {
   sim = new Sim(world, graph, { seed: 20260825 });
   game = new Game(sim, view, ui);
   console.log('[hometown] street graph', graph.stats());
+
+  // A shared city arrives as a diff in the URL hash and is replayed through
+  // COMMANDS, so it can only reach a state a player could have reached.
+  const shared = pendingShare;
+  pendingShare = null;
+  if (shared) {
+    bootMsg.textContent = 'replaying a shared city…';
+    await yieldToPaint();
+    try {
+      const res = applyShare(sim, shared);
+      // The guest inherits the author's log, so re-sharing keeps the history.
+      for (const e of shared.entries) game.log.record(e.day, e.cmd);
+      game.refreshHud(); game.refreshRoads(); game.refreshSelection();
+      if (sim.seaLevel !== 0) {
+        view.buildWater(sim.floodMask, sim.seaLevel);
+        const slider = document.getElementById('sea-slider');
+        if (slider) slider.value = String(Math.round(sim.seaLevel * 10));
+        document.getElementById('sea-value').textContent =
+          (sim.seaLevel >= 0 ? '+' : '') + sim.seaLevel.toFixed(1) + ' m';
+      }
+      game.applyOverlay('none');
+      console.log('[hometown] shared city applied', res);
+      setTimeout(() => game.toast(
+        `Someone else's ${world.name.replace(/-/g, ' ')} — ${res.applied} change${res.applied === 1 ? '' : 's'}` +
+        (res.skipped ? ` (${res.skipped} skipped)` : '')), 700);
+    } catch (e) {
+      console.error('share failed', e);
+      setTimeout(() => game.toast('That share link could not be read: ' + e.message, true), 700);
+    }
+  }
 
   bootEl.classList.add('gone');
   window.__ht = { world, view, ui, graph, sim, game };   // console handle for verification
@@ -157,10 +189,14 @@ addEventListener('keydown', e => {
   if (e.key === 'Tab') e.preventDefault();
   if (!game) return;
   if (e.key === 'Escape') game.clearSelection();
+  if (e.key.toLowerCase() === 'c' && !e.repeat) game.setCompare(true);
   if (e.key === ' ') { e.preventDefault(); game.setSpeed(game.speed === 0 ? 1 : 0); }
   if (e.key >= '1' && e.key <= '4') game.setSpeed(+e.key - 1);
 });
-addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+addEventListener('keyup', e => {
+  keys[e.key.toLowerCase()] = false;
+  if (e.key.toLowerCase() === 'c' && game) game.setCompare(false);
+});
 addEventListener('resize', () => view?.resize());
 
 function pollKeys(dt) {
@@ -230,11 +266,24 @@ function loop(now) {
       .map(w => `<option value="${w.name}">${w.label || w.name}</option>`).join('');
     pick.addEventListener('change', () => loadWorld(pick.value).catch(showError));
 
+    // Read the share code BEFORE choosing a world — the code names its own.
     const params = new URLSearchParams(location.search);
+    const hash = new URLSearchParams(location.hash.replace(/^#/, ''));
+    const shareCode = hash.get('s');
+    if (shareCode) {
+      try {
+        pendingShare = await decodeShare(shareCode);
+        console.log('[hometown] share code decoded', pendingShare.world,
+          `${pendingShare.entries.length} commands over ${pendingShare.finalDay} days`);
+      } catch (e) {
+        console.error('bad share code', e);
+        pendingShare = null;
+      }
+    }
     // The flagship opens by default; the manifest is sorted alphabetically, so
     // without this the first world alphabetically would greet every new player.
     const flagship = worlds.find(w => w.flagship) || worlds[0];
-    const want = params.get('world') || flagship.name;
+    const want = (pendingShare && pendingShare.world) || params.get('world') || flagship.name;
     pick.value = worlds.some(w => w.name === want) ? want : worlds[0].name;
 
     await loadWorld(pick.value);
