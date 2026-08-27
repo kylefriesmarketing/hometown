@@ -18,6 +18,7 @@ import {
   SERVICE_KINDS, SERVICE_INDEX, SERVICE_UPKEEP,
 } from './data.js';
 import { chamferFrom, sampleField, stampPoint, floodFromEdges, maskAt } from './field.js';
+import { NODE_BY_ID, canBuy, costOf, effectsOf, MOMENTUM } from './tree.js';
 
 const Z_NONE = ZONE_INDEX.none;
 const Z_RES = ZONE_INDEX.residential;
@@ -51,6 +52,15 @@ export class Sim {
     this.money = opts.startMoney ?? SIM.startMoney;
     this.bankrupt = false;
     this.seaLevel = opts.seaLevel ?? 0;
+
+    // The spine: a currency, a set of things bought with it, and the problems
+    // on the map that pay it out.
+    this.momentum = opts.momentum ?? MOMENTUM.startingMomentum;
+    this.owned = new Set();
+    this.fx = effectsOf(this.owned);
+    this.bubbles = [];
+    this.bubbleSeq = 0;
+    this.claimed = new Map();     // bubble key -> day it may return
 
     const n = world.buildings.length;
     this.n = n;
@@ -94,6 +104,7 @@ export class Sim {
 
     // Prime the picture so tick 0 is not a blank city.
     this._fullTrafficPass();
+    this._refreshBubbles();
     for (let i = 0; i < n; i++) this._updateDesire(i);
   }
 
@@ -125,7 +136,23 @@ export class Sim {
     if (!def || !def.areaPer) return 0;
     const b = this.world.buildings[i];
     const floorArea = b.a * Math.max(1, b.lv);
-    return floorArea / def.areaPer;
+    let cap = floorArea / def.areaPer;
+
+    const fx = this.fx || {};
+    cap *= fx.capacityMul || 1;
+    // Mixed use puts homes above the shops, so commercial stock houses people
+    // as well as employing them.
+    if (fx.mixedUse && z === Z_COM) cap *= 1.3;
+    // Transit-oriented development: density pays off next to a stop.
+    if (fx.tod && this.transit && this.transit.length) {
+      const c = b.c;
+      for (const line of this.transit) {
+        for (const [sx, sz] of line.stops) {
+          if (Math.hypot(c[0] - sx, c[1] - sz) < 320) return cap * 1.6;
+        }
+      }
+    }
+    return cap;
   }
 
   /** Distance fields the desirability model reads. */
@@ -222,13 +249,17 @@ export class Sim {
    */
   _rebuildFlood() {
     const w = this.world;
-    this.floodMask = floodFromEdges(w.heights, w.cols, w.rows, this.seaLevel);
+    // Storm drains and seawalls do not lower the sea; they raise what the city
+    // can take, which is the same thing to the model and the honest framing.
+    const effective = this.seaLevel - (this.fx ? this.fx.floodOffset : 0);
+    this.floodMask = floodFromEdges(w.heights, w.cols, w.rows, effective);
+    this._effectiveSea = effective;
 
     let drowned = 0, displaced = 0;
     for (let i = 0; i < this.n; i++) {
       const c = w.buildings[i].c;
       const under = maskAt(this.floodMask, w.cols, w.rows, w.cell, w.x0, w.z0, c[0], c[1])
-        && w.buildings[i].gm < this.seaLevel;
+        && w.buildings[i].gm < this._effectiveSea;
       this.floodedB[i] = under ? 1 : 0;
       if (under) {
         drowned++;
@@ -247,7 +278,7 @@ export class Sim {
       const mx = (g.nx[g.ea[e]] + g.nx[g.eb[e]]) / 2;
       const mz = (g.nz[g.ea[e]] + g.nz[g.eb[e]]) / 2;
       const under = maskAt(this.floodMask, w.cols, w.rows, w.cell, w.x0, w.z0, mx, mz)
-        && w.heightAt(mx, mz) < this.seaLevel;
+        && w.heightAt(mx, mz) < this._effectiveSea;
       this.floodedE[e] = under ? 1 : 0;
       if (under) cutEdges++;
     }
@@ -295,7 +326,8 @@ export class Sim {
     this._trafficSlice();
     this._buildingSlice();
 
-    if (this.day % TICK.daysPerMonth === 0) this._settleFinances();
+    if (this.day % TICK.daysPerMonth === 0) { this._settleFinances(); this._earnMomentum(); }
+    if (this.day % 10 === 0) this._refreshBubbles();
 
     this._recomputeTotals();
     return this.stats;
@@ -509,7 +541,7 @@ export class Sim {
       const def = ZONES[ZONE_KINDS[z]];
       income += this.occ[i] * (def.taxPerOccupant || 0);
       upkeep += this.occ[i] * (def.upkeepPerOccupant || 0);
-      if (this.service[i]) upkeep += this.occ[i] * SERVICE_UPKEEP;
+      if (this.service[i]) upkeep += this.occ[i] * SERVICE_UPKEEP * (this.fx.serviceUpkeepMul || 1);
     }
     // roads cost money to keep
     let km = 0;
@@ -603,6 +635,9 @@ export class Sim {
     }
     s.coverage = covW > 0 ? covT / covW : 0;
 
+    s.momentum = this.momentum;
+    s.owned = this.owned.size;
+    s.bubbles = this.bubbles.length;
     s.transitShare = rw > 0 ? rt / rw : 0;
     s.transitLines = this.transit.length;
     s.transitKm = tkm;
@@ -637,6 +672,8 @@ export class Sim {
       case 'road': return this._cmdRoad(cmd);
       case 'transit': return this._cmdTransit(cmd);
       case 'service': return this._cmdService(cmd);
+      case 'build': return this._cmdBuild(cmd);
+      case 'claim': return this._cmdClaim(cmd);
       default: return { ok: false, reason: `unknown command "${cmd.t}"` };
     }
   }
@@ -650,7 +687,7 @@ export class Sim {
     let cost = 0;
     for (const i of ids) {
       if (this.zone[i] === z) continue;
-      cost += this.world.buildings[i].a * REZONE_COST_PER_M2;
+      cost += this.world.buildings[i].a * REZONE_COST_PER_M2 * (this.fx.rezoneMul || 1);
     }
     if (cost > this.money) return { ok: false, reason: 'not enough money', cost };
 
@@ -839,7 +876,8 @@ export class Sim {
     const c = this.world.buildings[i].c;
     let total = 0, sw = 0;
     for (const [key, def] of Object.entries(SERVICES)) {
-      total += def.weight * decay(this._sample(this.serviceDist[key], c[0], c[1]), FALLOFF.service);
+      total += def.weight * decay(this._sample(this.serviceDist[key], c[0], c[1]),
+        FALLOFF.service * (this.fx ? this.fx.serviceReachMul || 1 : 1));
       sw += def.weight;
     }
     return sw > 0 ? total / sw : 0;
@@ -884,6 +922,127 @@ export class Sim {
     return { ok: true, count: changed, cost, kind };
   }
 
+
+  // ── the spine: momentum, the tree, and the problems that pay for it ──────
+
+  /** Buy a node. The one place `owned` and `momentum` may change together. */
+  _cmdBuild(cmd) {
+    const node = NODE_BY_ID[cmd.id];
+    if (!node) return { ok: false, reason: 'no such upgrade' };
+    const check = canBuy(node, this.owned, this.momentum);
+    if (!check.ok) return { ok: false, reason: check.reason, cost: check.cost };
+
+    this.momentum -= check.cost;
+    this.owned.add(node.id);
+    this._applyEffects();
+    return { ok: true, id: node.id, cost: check.cost, label: node.label };
+  }
+
+  /**
+   * Recompute everything a tree node can touch.
+   *
+   * ⚠️ Junction delay lives in the GRAPH's free-flow times, so Signal Priority
+   * has to rebuild them — the whole road network gets faster, which is the
+   * point. Capacity is per building, so every building is re-derived.
+   */
+  _applyEffects() {
+    this.fx = effectsOf(this.owned);
+    this.graph.setJunctionScale(this.fx.junctionMul);
+    for (let i = 0; i < this.n; i++) this.cap[i] = this._capacityOf(i, this.zone[i]);
+    this._rebuildFlood();
+    this._rebuildServices();
+    this._aggregateZones();
+    this._fullTrafficPass();
+    for (let i = 0; i < this.n; i++) this._updateDesire(i);
+    this._recomputeTotals();
+  }
+
+  /**
+   * Claim a problem on the map.
+   *
+   * ⚠️ Bubbles are DERIVED, never rolled: a bubble exists because a specific
+   * street is jammed or a specific block is unserved. That keeps the whole
+   * mechanic deterministic without spending a single rng draw, and it means
+   * clicking one always teaches the player something true about their city.
+   */
+  _cmdClaim(cmd) {
+    const b = this.bubbles.find(x => x.key === cmd.key);
+    if (!b) return { ok: false, reason: 'that is no longer there' };
+    this.momentum += b.value;
+    this.claimed.set(b.key, this.day + MOMENTUM.bubbleCooldownDays);
+    this.bubbles = this.bubbles.filter(x => x.key !== cmd.key);
+    return { ok: true, value: b.value, kind: b.kind };
+  }
+
+  /**
+   * Find the worst handful of problems in the city and surface them.
+   * Deterministic: a scan in index order, best-first, no randomness.
+   */
+  _refreshBubbles() {
+    for (const [k, until] of this.claimed) if (this.day >= until) this.claimed.delete(k);
+
+    const found = [];
+    const g = this.graph;
+
+    // jammed streets
+    for (let e = 0; e < g.baseEdgeCount; e++) {
+      const ratio = g.load[e] / g.capacityOf(e);
+      if (ratio < 1.1) continue;
+      const key = 'j' + g.eroad[e];
+      if (this.claimed.has(key)) continue;
+      const x = (g.nx[g.ea[e]] + g.nx[g.eb[e]]) / 2;
+      const z = (g.nz[g.ea[e]] + g.nz[g.eb[e]]) / 2;
+      found.push({ key, kind: 'jam', x, z, score: ratio,
+        value: Math.min(MOMENTUM.bubbleMax, Math.round(MOMENTUM.bubbleBase + ratio * 2)),
+        label: 'Gridlock' });
+    }
+
+    // people living where nothing serves them
+    for (let i = 0; i < this.n; i += 7) {
+      if (this.zone[i] !== Z_RES || this.occ[i] < 20) continue;
+      const cover = this.serviceScoreAt(i);
+      if (cover > 0.3) continue;
+      const key = 's' + i;
+      if (this.claimed.has(key)) continue;
+      found.push({ key, kind: 'unserved', x: this.world.buildings[i].c[0], z: this.world.buildings[i].c[1],
+        score: (0.3 - cover) * this.occ[i],
+        value: Math.min(MOMENTUM.bubbleMax, Math.round(MOMENTUM.bubbleBase + (0.3 - cover) * 20)),
+        label: 'No services' });
+    }
+
+    // stock standing empty
+    for (let i = 0; i < this.n; i += 11) {
+      if (this.zone[i] === Z_NONE || this.cap[i] < 30) continue;
+      const fill = this.occ[i] / this.cap[i];
+      if (fill > 0.25) continue;
+      const key = 'v' + i;
+      if (this.claimed.has(key)) continue;
+      found.push({ key, kind: 'vacant', x: this.world.buildings[i].c[0], z: this.world.buildings[i].c[1],
+        score: this.cap[i] * (0.25 - fill),
+        value: Math.min(MOMENTUM.bubbleMax, Math.round(MOMENTUM.bubbleBase + this.cap[i] / 60)),
+        label: 'Standing empty' });
+    }
+
+    found.sort((a, b) => b.score - a.score || (a.key < b.key ? -1 : 1));
+    this.bubbles = found.slice(0, MOMENTUM.maxBubbles);
+  }
+
+  /** Monthly payout: a city that works funds its own next move. */
+  _earnMomentum() {
+    // Quality, not scale — see the warning on MOMENTUM in tree.js.
+    const cover = Math.max(0, Math.min(1, this.stats.coverage || 0));
+    const over = Math.max(0, (this.stats.commute || 0) - MOMENTUM.commuteTarget);
+    const flow = Math.max(0, 1 - over * MOMENTUM.commutePenalty);
+    const housed = this.stats.housingCap > 0
+      ? Math.max(0, Math.min(1, this.stats.population / this.stats.housingCap)) : 0;
+
+    const quality = cover * 0.4 + flow * 0.4 + housed * 0.2;
+    const gain = MOMENTUM.perMonth * (MOMENTUM.floorShare + (1 - MOMENTUM.floorShare) * quality);
+    this.momentum += gain;
+    this.lastMomentumGain = gain;
+    return gain;
+  }
+
   // ── save / load / hash ───────────────────────────────────────────────────
 
   /**
@@ -903,6 +1062,9 @@ export class Sim {
       seed: this.seed, rng: this.rng,
       day: this.day, money: this.money, bankrupt: this.bankrupt,
       seaLevel: this.seaLevel,
+      momentum: this.momentum,
+      owned: [...this.owned].sort(),
+      claimed: [...this.claimed].sort((a, b) => (a[0] < b[0] ? -1 : 1)),
       zone: Array.from(this.zone),
       transit: this.transit.map(l => ({ id: l.id, kind: l.kind, stops: l.stops.map(p => [p[0], p[1]]) })),
       nextLineId: this.nextLineId,
@@ -937,6 +1099,11 @@ export class Sim {
     this.money = s.money;
     this.bankrupt = !!s.bankrupt;
     this.seaLevel = s.seaLevel ?? 0;
+    this.momentum = s.momentum ?? 0;
+    this.owned = new Set(s.owned || []);
+    this.claimed = new Map(s.claimed || []);
+    this.fx = effectsOf(this.owned);
+    this.graph.setJunctionScale(this.fx.junctionMul);
     this.zone.set(s.zone);
     this.occ.set(s.occ);
     // ⚠️ Transit FIRST: it resizes every per-edge array, so restoring road and
@@ -992,6 +1159,10 @@ export class Sim {
     mix(this.bankrupt ? 1 : 0);
     mix(this._bCursor); mix(this._zCursor);
     mix(Math.round(this.seaLevel * 1000));
+    mix(Math.round(this.momentum * 100));
+    for (const id of [...this.owned].sort()) {
+      for (let k = 0; k < id.length; k++) mix(id.charCodeAt(k) * (k + 3));
+    }
     for (let i = 0; i < this.roadState.length; i++) {
       mix(this.roadState[i] * 13 + 3);
       mix(Math.round(this.roadLanes[i] * 100));

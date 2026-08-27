@@ -6,6 +6,7 @@
 
 import { TICK, ZONES, ZONE_KINDS, ZONE_INDEX, OVERLAYS, REZONE_COST_PER_M2, TRANSIT, SERVICES, SERVICE_KINDS, SERVICE_INDEX } from './data.js';
 import { encode as encodeShare, CommandLog } from './share.js';
+import { BRANCHES, NODES, NODE_BY_ID, costOf, canBuy } from './tree.js';
 
 const $ = id => document.getElementById(id);
 const fmt = n => Math.round(n).toLocaleString();
@@ -81,6 +82,14 @@ export class Game {
     this.comparing = false;
     this.drawing = null;      // {kind, stops:[[x,z],…]} while laying a line
 
+    // Buildings paint themselves from occupancy, so the city visibly thrives or
+    // empties without the player switching to an overlay.
+    view.lifeOf = i => {
+      if (this.sim.zone[i] === ZONE_INDEX.none) return this.sim.service[i] ? 1 : 0;
+      const cap = this.sim.cap[i];
+      return cap > 0 ? Math.min(1, this.sim.occ[i] / cap) : null;
+    };
+
     this._buildSpeeds();
     this._buildSeaSlider();
     this._buildOverlays();
@@ -89,6 +98,7 @@ export class Game {
     this._buildRoadButtons();
     this._buildShare();
     this._buildTransitButtons();
+    this._buildTree();
     this.refreshHud();
     this.refreshRoads();
     this.applyOverlay('none');
@@ -108,7 +118,19 @@ export class Game {
     }
 
     this._hudT += dt;
-    if (this._hudT >= 0.25) { this._hudT = 0; this.refreshHud(); this.repaintOverlay(); }
+    if (this._hudT >= 0.25) {
+      this._hudT = 0;
+      this.refreshHud();
+      this.repaintOverlay();
+      if (this.overlay === 'none' && mult > 0) this.view.paintBuildings('none', null);
+      this.view.buildBubbles(this.sim.bubbles);
+      this.refreshTree();
+    }
+
+    // Traffic is redistributed on a slower beat than it is drawn: the pattern
+    // only changes when the model does, but the cars move every frame.
+    this._trafficT = (this._trafficT || 0) + dt;
+    if (this._trafficT >= 2.5) { this._trafficT = 0; this.view.traffic?.sync(); }
   }
 
   setSpeed(s) {
@@ -149,6 +171,7 @@ export class Game {
     $('sea-info').innerHTML = level === 0 && !f.buildings
       ? 'drag to raise the sea'
       : `<b>${fmt(f.buildings)}</b> buildings under water · <b>${fmt(f.displaced)}</b> people displaced · <b>${f.roads}</b> streets cut`;
+    this.view.traffic?.sync();
     this.refreshHud();
     this.refreshRoads();
     this.repaintOverlay(true);
@@ -176,6 +199,9 @@ export class Game {
     // ⚠️ The treasury used to live here and it was noise: in a sandbox with no
     // fail state it only ever climbs, so it told the player nothing. The mean
     // commute is the number that actually responds to what they do to the city.
+    const mm = $('m-momentum');
+    if (mm) mm.textContent = Math.floor(sim.momentum).toLocaleString();
+
     const cv = $('m-coverage');
     if (cv) {
       const c = sim.stats.coverage || 0;
@@ -340,6 +366,93 @@ export class Game {
   }
 
 
+
+  // ── the plan ─────────────────────────────────────────────────────────────
+
+  _buildTree() {
+    const btn = $('tree-btn'), panel = $('tree-panel'), close = $('tree-close');
+    if (!btn) return;
+    btn.addEventListener('click', () => this.toggleTree());
+    close?.addEventListener('click', () => this.toggleTree(false));
+
+    const cols = $('tree-cols');
+    cols.innerHTML = '';
+    this._nodeEls = new Map();
+    for (const [key, br] of Object.entries(BRANCHES)) {
+      const col = document.createElement('div');
+      col.innerHTML = `<div class="tcol-head">${br.icon} ${br.label}</div>
+                       <div class="tcol-blurb">${br.blurb}</div>`;
+      for (const n of NODES.filter(x => x.branch === key)) {
+        const b = document.createElement('button');
+        b.className = 'tnode';
+        b.innerHTML = `<span class="ic">${n.icon}</span>
+          <span><span class="nm">${n.label}</span><span class="bl">${n.blurb}</span></span>
+          <span class="px"></span>`;
+        b.addEventListener('click', () => this.buyNode(n.id));
+        col.appendChild(b);
+        this._nodeEls.set(n.id, b);
+      }
+      cols.appendChild(col);
+    }
+    this.refreshTree();
+  }
+
+  toggleTree(force) {
+    const panel = $('tree-panel');
+    const open = force === undefined ? !panel.classList.contains('open') : force;
+    panel.classList.toggle('open', open);
+    if (open) this.refreshTree();
+  }
+
+  buyNode(id) {
+    const r = this.issue({ t: 'build', id });
+    if (!r.ok) return this.toast(r.reason === 'not enough momentum'
+      ? `Not enough momentum — ${NODE_BY_ID[id].label} costs ${r.cost}` : r.reason, true);
+    this.toast(`${NODE_BY_ID[id].label} built · ${r.cost} momentum`);
+    this.refreshTree();
+    this.refreshHud();
+    this.refreshTransit();
+    this.view.traffic?.sync();
+    this.repaintOverlay(true);
+  }
+
+  refreshTree() {
+    if (!this._nodeEls) return;
+    const owned = this.sim.owned, mom = this.sim.momentum;
+    let anyAffordable = false;
+    for (const n of NODES) {
+      const el = this._nodeEls.get(n.id);
+      const px = el.querySelector('.px');
+      const has = owned.has(n.id);
+      el.classList.toggle('owned', has);
+      if (has) { px.textContent = 'BUILT'; px.className = 'px'; el.disabled = true; continue; }
+
+      const check = canBuy(n, owned, mom);
+      const cost = costOf(n, owned.size);
+      const locked = (n.needs || []).some(d => !owned.has(d));
+      el.disabled = locked || !check.ok;
+      el.classList.toggle('afford', check.ok);
+      px.textContent = locked ? '🔒' : cost;
+      px.className = 'px' + (check.ok ? '' : ' no');
+      if (check.ok) anyAffordable = true;
+    }
+    $('tree-btn')?.classList.toggle('can-buy', anyAffordable);
+  }
+
+  /** A click on the map may be a problem being claimed. */
+  tryClaim(px, py) {
+    const key = this.view.bubbleAt(px, py);
+    if (!key) return false;
+    const r = this.issue({ t: 'claim', key });
+    if (r.ok) {
+      this.toast(`+${r.value} momentum`);
+      this.refreshHud();
+      this.refreshTree();
+      this.view.buildBubbles(this.sim.bubbles);
+    }
+    return true;
+  }
+
   // ── transit ──────────────────────────────────────────────────────────────
 
   _buildTransitButtons() {
@@ -351,7 +464,13 @@ export class Game {
       b.textContent = `${spec.icon} ${spec.label}`;
       b.dataset.kind = key;
       b.title = `${spec.speed} km/h · ${spec.accessMin} min to reach a stop`;
-      b.addEventListener('click', () => this.startLine(key));
+      b.dataset.transit = key;
+      b.addEventListener('click', () => {
+        if (!this._transitUnlocked(key)) {
+          return this.toast(`${spec.label} is not unlocked yet — see The Plan`, true);
+        }
+        this.startLine(key);
+      });
       row.appendChild(b);
     }
     const fin = document.createElement('button');
@@ -372,7 +491,16 @@ export class Game {
     this.refreshTransit();
   }
 
+  /** Transit modes are earned in the tree, not given. */
+  _transitUnlocked(kind) {
+    const fx = this.sim.fx || {};
+    return kind === 'bus' ? !!fx.unlockBus
+      : kind === 'tram' ? !!fx.unlockTram
+      : kind === 'metro' ? !!fx.unlockMetro : false;
+  }
+
   startLine(kind) {
+    if (!this._transitUnlocked(kind)) return this.toast('Not unlocked yet — see The Plan', true);
     if (this.drawing && this.drawing.kind === kind) { this.cancelLine(); return; }
     this.drawing = { kind, stops: [] };
     this.clearSelection();
@@ -415,6 +543,7 @@ export class Game {
 
   afterTransit() {
     this.view.buildTransit(this.sim.transit);
+    this.view.traffic?.sync();
     this.refreshHud();
     this.refreshTransit();
     this.refreshRoads();
@@ -427,6 +556,9 @@ export class Game {
       for (const b of row.children) {
         if (!b.dataset.kind) continue;
         b.classList.toggle('drawing', !!this.drawing && this.drawing.kind === b.dataset.kind);
+        const unlocked = this._transitUnlocked(b.dataset.kind);
+        b.disabled = !unlocked;
+        b.style.opacity = unlocked ? '' : '0.45';
       }
     }
     const info = $('transit-info');
@@ -496,6 +628,7 @@ export class Game {
     const verb = { close: 'closed', open: 'reopened', widen: 'widened',
                    narrow: 'narrowed', remove: 'torn out' }[op] || op;
     this.toast(`${r.count} street${r.count === 1 ? '' : 's'} ${verb}`);
+    this.view.traffic?.sync();
     this.refreshHud();
     this.refreshRoads();
     this.repaintOverlay(true);
@@ -619,6 +752,7 @@ export class Game {
   }
 
   afterCommand() {
+    this.view.traffic?.sync();
     this.refreshHud();
     this.refreshSelection();
     this.repaintOverlay(true);

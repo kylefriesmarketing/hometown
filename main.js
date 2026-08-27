@@ -39,7 +39,11 @@ async function loadWorld(name) {
   bootMsg.textContent = 'building the town…';
   await yieldToPaint();                // let the message paint before we block
 
+  // ⚠️ The graph must exist BEFORE the view is built: traffic is created inside
+  // build() and needs it. This is why the graph is no longer made further down.
+  graph = new RoadGraph(world);
   view = new View(canvas, world);
+  view.useGraph(graph);
   const ms = view.build();
   console.log(`[hometown] built ${world.name} in ${ms.toFixed(0)} ms`,
     world.stats());
@@ -53,7 +57,6 @@ async function loadWorld(name) {
   syncOptions();
 
   // the play layer
-  graph = new RoadGraph(world);
   sim = new Sim(world, graph, { seed: 20260825 });
   game = new Game(sim, view, ui);
   console.log('[hometown] street graph', graph.stats());
@@ -132,6 +135,10 @@ canvas.addEventListener('pointerup', e => {
     const nx = ((e.clientX - r.left) / r.width) * 2 - 1;
     const ny = -((e.clientY - r.top) / r.height) * 2 + 1;
     try {
+      // A problem badge wins over everything else it may be sitting on top of.
+      const rect = canvas.getBoundingClientRect();
+      if (game.tryClaim(e.clientX - rect.left, e.clientY - rect.top)) { drag = null; canvas.classList.remove('dragging'); return; }
+
       const hit = view.pick(nx, ny);
       // While a line is being drawn, a click places a stop instead of selecting.
       if (hit && game.addStop(hit.x, hit.z)) { /* handled */ }
@@ -193,6 +200,7 @@ addEventListener('keydown', e => {
   if (!game) return;
   if (e.key === 'Escape') { game.cancelLine(); game.clearSelection(); }
   if (e.key === 'Enter') game.finishLine();
+  if (e.key.toLowerCase() === 't') game.toggleTree();
   if (e.key.toLowerCase() === 'c' && !e.repeat) game.setCompare(true);
   if (e.key === ' ') { e.preventDefault(); game.setSpeed(game.speed === 0 ? 1 : 0); }
   if (e.key >= '1' && e.key <= '4') game.setSpeed(+e.key - 1);
@@ -239,6 +247,10 @@ document.getElementById('opt-guessed').addEventListener('change', e => {
   view.applyGuessedShading();
 });
 
+document.getElementById('opt-traffic').addEventListener('change', e => {
+  view?.traffic?.setEnabled(e.target.checked);
+});
+
 document.getElementById('opt-shadows').addEventListener('change', e => {
   if (!view) return;
   view.renderer.shadowMap.enabled = e.target.checked;
@@ -257,6 +269,7 @@ function loop(now) {
   if (!view) return;
   pollKeys(dt);
   if (game) game.update(dt);
+  view.animate(dt);
   view.render();
 }
 

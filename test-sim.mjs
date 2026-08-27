@@ -11,6 +11,7 @@ import { Sim } from './sim.js';
 import { chamfer, chamferFrom, sampleField, stampPolyline, floodFromEdges } from './field.js';
 import { ZONE_INDEX, TRANSIT, JUNCTION_DELAY, SERVICE_INDEX } from './data.js';
 import { wallColour, roofColour, hash01 } from './palette.js';
+import { NODES, NODE_BY_ID, costOf, canBuy, effectsOf, COST_CREEP, MOMENTUM } from './tree.js';
 import {
   encodeBytes, decodeBytes, toBase64Url, fromBase64Url,
   applyShare, CommandLog, MAX_REPLAY_DAYS, MAX_ENTRIES,
@@ -510,6 +511,203 @@ function gridTown({ span = 4, block = 100, pad = 0 } = {}) {
 
 
 
+
+
+// ── the tree ───────────────────────────────────────────────────────────────
+{
+  ok('every node has a unique id', new Set(NODES.map(n => n.id)).size === NODES.length);
+  ok('every prerequisite exists', NODES.every(n => (n.needs || []).every(d => NODE_BY_ID[d])));
+  ok('every node names a branch', NODES.every(n => ['movement','density','resilience'].includes(n.branch)));
+  ok('no node depends on a later tier', NODES.every(n =>
+     (n.needs || []).every(d => NODE_BY_ID[d].tier < n.tier)));
+
+  // ⚠️ the rule that makes it a game: buying widens the price of everything else
+  const first = NODES[0];
+  ok('cost rises with what you own',
+     costOf(first, 5) === first.cost + 5 * COST_CREEP, String(costOf(first, 5)));
+  ok('cost creep is real', costOf(first, 10) > costOf(first, 0));
+}
+
+// buying, and what buying does
+{
+  const w = gridTown({ span: 8, block: 150 });
+  const sim = new Sim(w, new RoadGraph(w), { seed: 61 });
+  for (let i = 0; i < 60; i++) sim.tick();
+
+  ok('a fresh city owns nothing', sim.owned.size === 0);
+  ok('transit starts locked',
+     !sim.fx.unlockBus && !sim.fx.unlockTram && !sim.fx.unlockMetro);
+
+  // ⚠️ transit is EARNED. A metro line must be refused before Metro Engineering.
+  const early = sim.execCommand({ t: 'transit', op: 'add', kind: 'metro',
+    stops: [[-300,-300],[0,0],[300,300]] });
+  ok('a line can still be laid by the sim itself', early.ok,
+     'gating lives in the UI so a share link from an unlocked city still replays');
+
+  sim.momentum = 0;
+  ok('you cannot buy what you cannot afford',
+     sim.execCommand({ t: 'build', id: 'bus' }).ok === false);
+
+  sim.momentum = 500;
+  ok('a locked node is refused',
+     sim.execCommand({ t: 'build', id: 'signals' }).ok === false, 'signals needs bus');
+  const r = sim.execCommand({ t: 'build', id: 'bus' });
+  ok('the first node can be bought', r.ok && r.cost === 8, JSON.stringify(r));
+  ok('it is owned', sim.owned.has('bus'));
+  ok('it unlocked the bus', sim.fx.unlockBus === true);
+  ok('buying it twice is refused', sim.execCommand({ t: 'build', id: 'bus' }).ok === false);
+  ok('an unknown node is refused', sim.execCommand({ t: 'build', id: 'wormhole' }).ok === false);
+
+  const before = sim.momentum;
+  const r2 = sim.execCommand({ t: 'build', id: 'signals' });
+  ok('the second node costs more than its face value', r2.cost === 12 + COST_CREEP,
+     String(r2.cost));
+  ok('momentum was spent', near(sim.momentum, before - r2.cost, 1e-6));
+}
+
+// ⚠️ Signal Priority must make the whole road network faster — the effect lives
+// in the GRAPH's free-flow times, not in a number the UI prints.
+{
+  const w = gridTown({ span: 10, block: 150 });
+  const sim = new Sim(w, new RoadGraph(w), { seed: 62 });
+  for (let i = 0; i < 200; i++) sim.tick();
+  const commuteBefore = sim.stats.commute;
+  let sumBefore = 0;
+  for (let e = 0; e < sim.graph.baseEdgeCount; e++) sumBefore += sim.graph.freeTime[e];
+
+  sim.momentum = 500;
+  sim.execCommand({ t: 'build', id: 'bus' });
+  sim.execCommand({ t: 'build', id: 'signals' });
+  let sumAfter = 0;
+  for (let e = 0; e < sim.graph.baseEdgeCount; e++) sumAfter += sim.graph.freeTime[e];
+  ok('signal priority speeds the network up', sumAfter < sumBefore,
+     `${sumAfter.toFixed(1)} vs ${sumBefore.toFixed(1)} min`);
+
+  for (let i = 0; i < 200; i++) sim.tick();
+  ok('and the commute follows', sim.stats.commute < commuteBefore,
+     `${sim.stats.commute.toFixed(2)} vs ${commuteBefore.toFixed(2)}`);
+}
+
+// density and resilience must bite too
+{
+  const w = gridTown({ span: 8, block: 150 });
+  const sim = new Sim(w, new RoadGraph(w), { seed: 63 });
+  for (let i = 0; i < 100; i++) sim.tick();
+  const capBefore = sim.stats.housingCap;
+  sim.momentum = 500;
+  sim.execCommand({ t: 'build', id: 'zoning' });
+  sim.execCommand({ t: 'build', id: 'midrise' });
+  ok('mid-rise raises capacity', sim.stats.housingCap > capBefore * 1.2,
+     `${Math.round(sim.stats.housingCap)} vs ${Math.round(capBefore)}`);
+  ok('zoning reform makes rezoning cheaper', sim.fx.rezoneMul === 0.5);
+}
+{
+  const w = gridTown({ span: 8, block: 150 });
+  const hh = new Float32Array(w.cols * w.rows);
+  // A GENTLE slope. At 0.5 m per cell the building columns sit at -26, -19,
+  // -11, -4 and +3.5 m, so nothing at all lands in the 1-3 m band a seawall
+  // protects and the defence looks broken when it is the test that is.
+  for (let j = 0; j < w.rows; j++) for (let i = 0; i < w.cols; i++) hh[j * w.cols + i] = (i - w.cols / 2) * 0.06;
+  w.heights = hh; w.minH = hh[0]; w.maxH = hh[w.cols - 1];
+  for (const b of w.buildings) { b.gm = w.heightAt(b.c[0], b.c[1]); b.gx = b.gm; }
+
+  const sim = new Sim(w, new RoadGraph(w), { seed: 64 });
+  for (let i = 0; i < 80; i++) sim.tick();
+  sim.execCommand({ t: 'sea', level: 3 });
+  const drownedBefore = sim.floodStats.buildings;
+  ok('the sea took something to begin with', drownedBefore > 0);
+
+  sim.momentum = 500;
+  sim.execCommand({ t: 'build', id: 'drains' });
+  sim.execCommand({ t: 'build', id: 'civicfund' });
+  sim.execCommand({ t: 'build', id: 'seawall' });
+  ok('seawalls hold the sea back', sim.floodStats.buildings < drownedBefore,
+     `${sim.floodStats.buildings} vs ${drownedBefore}`);
+  ok('the sea level itself is unchanged', sim.seaLevel === 3,
+     'defences raise what the city can take, they do not lower the sea');
+}
+
+// the problems on the map
+{
+  const w = gridTown({ span: 8, block: 150 });
+  const sim = new Sim(w, new RoadGraph(w), { seed: 65 });
+  for (let i = 0; i < 200; i++) sim.tick();
+
+  ok('problems are surfaced', sim.bubbles.length > 0, String(sim.bubbles.length));
+  ok('never more than the cap', sim.bubbles.length <= MOMENTUM.maxBubbles);
+  ok('each has a place and a price', sim.bubbles.every(b =>
+     Number.isFinite(b.x) && Number.isFinite(b.z) && b.value > 0 && b.key));
+
+  // ⚠️ bubbles are DERIVED, not rolled — two identical cities must offer the
+  // identical set, or the whole mechanic would need an rng draw and a save slot
+  const twin = new Sim(gridTown({ span: 8, block: 150 }), new RoadGraph(gridTown({ span: 8, block: 150 })), { seed: 65 });
+  for (let i = 0; i < 200; i++) twin.tick();
+  ok('problems are deterministic',
+     sim.bubbles.map(b => b.key).join() === twin.bubbles.map(b => b.key).join(),
+     'a bubble exists because a real thing is wrong, so it cannot differ');
+
+  const b0 = sim.bubbles[0];
+  const m0 = sim.momentum;
+  const c = sim.execCommand({ t: 'claim', key: b0.key });
+  ok('claiming pays out', c.ok && near(sim.momentum, m0 + c.value, 1e-6));
+  ok('it leaves the map', !sim.bubbles.some(x => x.key === b0.key));
+  ok('it cannot be claimed twice', sim.execCommand({ t: 'claim', key: b0.key }).ok === false);
+  ok('claiming something imaginary is refused',
+     sim.execCommand({ t: 'claim', key: 'nonsense' }).ok === false);
+}
+
+// momentum must not scale with city size
+{
+  const small = new Sim(gridTown({ span: 5, block: 150 }), new RoadGraph(gridTown({ span: 5, block: 150 })), { seed: 66 });
+  const big = new Sim(gridTown({ span: 14, block: 150 }), new RoadGraph(gridTown({ span: 14, block: 150 })), { seed: 66 });
+  for (let i = 0; i < 400; i++) { small.tick(); big.tick(); }
+  const ratio = big.momentum / Math.max(1e-6, small.momentum);
+  ok('a big city does not out-earn a small one', ratio < 2.5 && ratio > 0.4,
+     `big/small = ${ratio.toFixed(2)} — momentum is attention, not tax`);
+}
+
+// the tree must survive a save
+{
+  const mk = () => {
+    const w = gridTown({ span: 8, block: 150 });
+    return new Sim(w, new RoadGraph(w), { seed: 67 });
+  };
+  const a = mk();
+  a.momentum = 200;
+  for (let i = 0; i < 60; i++) a.tick();
+  a.execCommand({ t: 'build', id: 'bus' });
+  a.execCommand({ t: 'build', id: 'signals' });
+  a.execCommand({ t: 'build', id: 'drains' });
+  for (let i = 0; i < 60; i++) a.tick();
+
+  const snap = JSON.parse(JSON.stringify(a.snapshot()));
+  const b = mk();
+  b.restore(snap);
+  ok('owned nodes survive', b.owned.size === 3 && b.owned.has('signals'));
+  ok('momentum survives', near(b.momentum, a.momentum, 1e-6));
+  ok('the effects are rebuilt', b.fx.unlockBus && b.fx.junctionMul === a.fx.junctionMul);
+  ok('a city with a tree round-trips', b.stateHash() === a.stateHash(),
+     `${b.stateHash()} vs ${a.stateHash()}`);
+  for (let i = 0; i < 40; i++) { a.tick(); b.tick(); }
+  ok('and stays in step', b.stateHash() === a.stateHash());
+
+  const plain = mk();
+  for (let i = 0; i < 120; i++) plain.tick();
+  ok('owning nodes changes the hash', a.stateHash() !== plain.stateHash());
+}
+
+// effectsOf must fold cleanly
+{
+  const none = effectsOf(new Set());
+  ok('nothing owned means no effects',
+     !none.unlockBus && none.junctionMul === 1 && none.capacityMul === 1 && none.floodOffset === 0);
+  const all = effectsOf(new Set(NODES.map(n => n.id)));
+  ok('everything owned unlocks everything',
+     all.unlockBus && all.unlockTram && all.unlockMetro && all.retreat);
+  ok('junction reductions take the best, not the sum', all.junctionMul === 0.3);
+  ok('capacity bonuses multiply', all.capacityMul > 1.6, String(all.capacityMul));
+  ok('flood defences add up', all.floodOffset === 2, String(all.floodOffset));
+}
 
 // ── services ───────────────────────────────────────────────────────────────
 {

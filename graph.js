@@ -161,15 +161,19 @@ export class RoadGraph {
     // half of each endpoint's delay is charged to the edge so a through trip
     // pays each intersection exactly once however it is split into edges.
     const degree = n => this.adjStart[n + 1] - this.adjStart[n];
-    this.freeTime = new Float32Array(this.edgeCount);
+    this._driveTime = new Float32Array(this.edgeCount);
+    this._junctionTime = new Float32Array(this.edgeCount);
     for (let e = 0; e < this.edgeCount; e++) {
-      const drive = this.elen[e] / (this.espeed[e] * 1000 / 60);
+      this._driveTime[e] = this.elen[e] / (this.espeed[e] * 1000 / 60);
       const per = JUNCTION_DELAY[this.ekind[e]] ?? JUNCTION_DELAY.street;
       let junction = 0;
       if (degree(this.ea[e]) >= JUNCTION_MIN_DEGREE) junction += per / 2;
       if (degree(this.eb[e]) >= JUNCTION_MIN_DEGREE) junction += per / 2;
-      this.freeTime[e] = drive + junction;
+      this._junctionTime[e] = junction;
     }
+    this._junctionScale = 1;
+    this.freeTime = new Float32Array(this.edgeCount);
+    this._recomputeFreeTime();
     this._buildNodeIndex();
   }
 
@@ -279,6 +283,27 @@ export class RoadGraph {
     // of to the street, and transit would quietly detach from the city.
     this._buildNodeIndex(this.baseNodeCount);
     return this;
+  }
+
+  /**
+   * Retune how much a junction costs — Signal Priority and Grade Separation.
+   * Driving time and junction time are kept apart precisely so this is a
+   * multiply rather than a rebuild of the whole network.
+   */
+  setJunctionScale(scale) {
+    if (scale === this._junctionScale) return;
+    this._junctionScale = scale;
+    this._recomputeFreeTime();
+  }
+
+  _recomputeFreeTime() {
+    const n = Math.min(this.baseEdgeCount ?? this.edgeCount, this._driveTime.length);
+    for (let e = 0; e < n; e++) {
+      this.freeTime[e] = this._driveTime[e] + this._junctionTime[e] * this._junctionScale;
+    }
+    if (this._base) {
+      for (let e = 0; e < n; e++) this._base.freeTime[e] = this.freeTime[e];
+    }
   }
 
   /** Total route length per line, metres — for the UI and for upkeep. */

@@ -15,6 +15,7 @@ import {
   FOLIAGE, TRUNK, TREE_DENSITY,
 } from './palette.js';
 import { TRANSIT } from './data.js';
+import { Traffic } from './traffic.js';
 
 // Vertical layering — small, fixed offsets so draped surfaces never z-fight.
 // ⚠️ `foot` sits BELOW `road` on purpose. A well-mapped city tags every
@@ -84,6 +85,9 @@ export class View {
       minDist: 25, maxDist: world.width * 1.1,
     };
     this.cam.fy = world.heightAt(0, 0);
+
+    this.traffic = null;
+    this.lifeOf = null;     // i -> 0..1 occupancy, set by the game layer
 
     this._sky();
     this._lights();
@@ -180,6 +184,9 @@ export class View {
 
   // ─── build ────────────────────────────────────────────────────────────────
 
+  /** The graph must be known before build() so traffic can be created with it. */
+  useGraph(graph) { this._graph = graph; }
+
   build() {
     const t0 = performance.now();
     this.buildTerrain();
@@ -187,6 +194,7 @@ export class View {
     this.buildRoads();
     this.buildBuildings();
     this.buildTrees();
+    this.traffic = new Traffic(this.world, this._graph, this.scene);
     return performance.now() - t0;
   }
 
@@ -703,6 +711,73 @@ export class View {
     group.add(marks);
   }
 
+
+  /**
+   * The clickable problems — Plague Inc's bubbles, but derived from the model
+   * rather than rolled, so every one of them is telling the truth about the
+   * city. Drawn as sprites so they always face the camera and stay legible at
+   * any zoom, with depthTest off so a problem is never hidden behind a tower.
+   */
+  buildBubbles(bubbles) {
+    if (!this._bubbleGroup) {
+      this._bubbleGroup = new THREE.Group();
+      this._bubbleGroup.renderOrder = 950;
+      this.scene.add(this._bubbleGroup);
+      this._bubbleTex = {};
+    }
+    // reuse sprites; a bubble list is at most a handful
+    while (this._bubbleGroup.children.length > bubbles.length) {
+      this._bubbleGroup.remove(this._bubbleGroup.children[this._bubbleGroup.children.length - 1]);
+    }
+    this.bubbles = bubbles;
+
+    for (let i = 0; i < bubbles.length; i++) {
+      const b = bubbles[i];
+      let sp = this._bubbleGroup.children[i];
+      if (!sp) {
+        sp = new THREE.Sprite(new THREE.SpriteMaterial({ depthTest: false, transparent: true }));
+        this._bubbleGroup.add(sp);
+      }
+      const key = b.kind;
+      if (!this._bubbleTex[key]) this._bubbleTex[key] = makeBubbleTexture(key);
+      sp.material.map = this._bubbleTex[key];
+      sp.material.needsUpdate = true;
+      const y = this.world.heightAt(b.x, b.z);
+      sp.position.set(b.x, y + 48, b.z);
+      const s = Math.max(26, this.cam.dist * 0.055);
+      sp.scale.set(s, s, 1);
+      sp.userData.key = b.key;
+    }
+  }
+
+  /** Screen position of a world point, in CSS pixels. */
+  project(x, y, z) {
+    const v3 = new THREE.Vector3(x, y, z).project(this.camera);
+    const r = this.canvas.getBoundingClientRect();
+    return {
+      x: (v3.x * 0.5 + 0.5) * r.width,
+      y: (-v3.y * 0.5 + 0.5) * r.height,
+      behind: v3.z > 1,
+    };
+  }
+
+  /**
+   * Which problem was clicked, if any. Screen-space distance rather than a
+   * raycast: sprites are billboards with no useful geometry to hit, and a
+   * generous radius is what makes them feel tappable.
+   */
+  bubbleAt(px, py, radius = 34) {
+    if (!this._bubbleGroup) return null;
+    let best = null, bestD = radius * radius;
+    for (const sp of this._bubbleGroup.children) {
+      const p = this.project(sp.position.x, sp.position.y, sp.position.z);
+      if (p.behind) continue;
+      const d = (p.x - px) ** 2 + (p.y - py) ** 2;
+      if (d < bestD) { bestD = d; best = sp.userData.key; }
+    }
+    return best;
+  }
+
   // ─── colouring ────────────────────────────────────────────────────────────
 
   /**
@@ -728,6 +803,24 @@ export class View {
       if (overlay === 'none' || !data) {
         wall = wallColour(i, b.kind, b.h);
         roof = roofColour(i);
+        // ⚠️ THE CITY MUST SHOW ITS OWN STATE. Without this, a thriving block
+        // and a dead one are pixel-identical and every consequence of a
+        // player's action has to be read off a number in a bar. An empty
+        // building goes grey and cold; a full one keeps its colour.
+        if (this.lifeOf) {
+          const life = this.lifeOf(i);
+          if (life !== null && life < 0.85) {
+            const k = Math.max(0, Math.min(1, 1 - life / 0.85));   // 0 lived-in, 1 derelict
+            c.setHex(wall);
+            const l = c.r * 0.3 + c.g * 0.59 + c.b * 0.11;
+            wall = c.setRGB(c.r + (l - c.r) * 0.85 * k, c.g + (l - c.g) * 0.85 * k, c.b + (l - c.b) * 0.85 * k)
+              .multiplyScalar(1 - 0.42 * k).getHex();
+            c.setHex(roof);
+            const lr = c.r * 0.3 + c.g * 0.59 + c.b * 0.11;
+            roof = c.setRGB(c.r + (lr - c.r) * 0.85 * k, c.g + (lr - c.g) * 0.85 * k, c.b + (lr - c.b) * 0.85 * k)
+              .multiplyScalar(1 - 0.35 * k).getHex();
+          }
+        }
       } else if (data.colourAt) {
         // categorical overlay (zoning): fixed colour per class
         const hex = data.colourAt(i);
@@ -817,6 +910,9 @@ export class View {
     this.renderer.render(this.scene, this.camera);
   }
 
+  /** Cars move every frame; nothing else here does. */
+  animate(dt) { if (this.traffic) this.traffic.update(dt); }
+
   /** Pick at normalised device coords. Returns {x, y, z, building}|null. */
   pick(ndcX, ndcY) {
     this._raycaster.setFromCamera({ x: ndcX, y: ndcY }, this.camera);
@@ -896,6 +992,33 @@ function mergeGeometries(list) {
   geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
   geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
   return geo;
+}
+
+const BUBBLE_LOOK = {
+  jam:      { icon: '🚗', ring: '#e0663c' },
+  unserved: { icon: '🎓', ring: '#d8a13c' },
+  vacant:   { icon: '🏚️', ring: '#8a93a6' },
+};
+
+/** A round badge with an icon — drawn once per kind and reused. */
+function makeBubbleTexture(kind) {
+  const look = BUBBLE_LOOK[kind] || BUBBLE_LOOK.jam;
+  const S = 128;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d');
+
+  g.beginPath(); g.arc(S / 2, S / 2, S * 0.40, 0, Math.PI * 2);
+  g.fillStyle = 'rgba(16,22,30,0.86)'; g.fill();
+  g.lineWidth = S * 0.075; g.strokeStyle = look.ring; g.stroke();
+
+  g.font = `${S * 0.42}px system-ui, "Segoe UI Emoji", sans-serif`;
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(look.icon, S / 2, S / 2 + S * 0.02);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
 }
 
 function pointInFlatRing(px, pz, r) {
