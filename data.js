@@ -28,8 +28,67 @@ export const ROAD_LANES = { metresPerLane: 3.4 };
 /** Vehicles per hour a single lane carries before it starts to break down. */
 export const LANE_CAPACITY = 700;
 
+/**
+ * Minutes lost crossing a real intersection, by the class of road you are on.
+ *
+ * ⚠️ WITHOUT THIS, CARS ARE ABSURDLY FAST. Free-flow speeds are SPEED LIMITS,
+ * not achieved speeds: with junctions free, a car crossed San Francisco at an
+ * effective 47.5 km/h door-to-door. Real core-city speeds are 20-25 km/h, and
+ * the whole difference is signals, stops and turns. It made transit impossible
+ * to justify — 0 of 38,423 trips chose a metro — and made every commute
+ * unrealistically short.
+ *
+ * A motorway pays nothing because it is grade-separated, which is precisely
+ * what makes an arterial worth more than a side street.
+ */
+export const JUNCTION_DELAY = {
+  highway: 0.00,
+  arterial: 0.22,   // ~13 s at a signal
+  street: 0.13,     // ~8 s, stop signs and yields
+  service: 0.10,
+  foot: 0,
+};
+
+/**
+ * A graph node only counts as an intersection if this many edges meet there.
+ * Degree 2 is usually just a place OSM split one street into two ways, and
+ * charging those would tax a straight road for being well mapped.
+ */
+export const JUNCTION_MIN_DEGREE = 3;
+
 /** Bureau of Public Roads volume-delay curve: t = t0 * (1 + a(v/c)^b). */
 export const BPR = { alpha: 0.15, beta: 4 };
+
+// ─── transit ────────────────────────────────────────────────────────────────
+//
+// A line is a list of stops. Each stop joins the street network by an "access"
+// edge, which is what makes transit useful to people near a stop and useless to
+// everyone else without any extra machinery.
+//
+// ⚠️ `accessMin` is charged at EACH END of a trip, so it is HALF the door-to-door
+// overhead, not the headway. It also has to be read as overhead *relative to
+// driving*: this model gives car trips no parking or walking cost at all, so
+// charging transit a full 5-minute wait against a free car makes every line
+// dead on arrival. Measured on San Francisco with a full wait at both ends:
+// ridership 0.0% on two metro lines, because a 6-minute overhead cannot beat a
+// 3.5-minute drive.
+
+export const TRANSIT = {
+  kinds: {
+    bus:   { label: 'Bus',   icon: '🚌', speed: 20, accessMin: 2.5, dwellMin: 0.30,
+             colour: 0xe0a13c, width: 5,  upkeepPerKm: 3 },
+    tram:  { label: 'Tram',  icon: '🚊', speed: 30, accessMin: 2.0, dwellMin: 0.25,
+             colour: 0x4ec08a, width: 6,  upkeepPerKm: 7 },
+    metro: { label: 'Metro', icon: '🚇', speed: 48, accessMin: 1.5, dwellMin: 0.20,
+             colour: 0xd2607a, width: 7,  upkeepPerKm: 18 },
+  },
+  /** How far a stop may reach to find a street to attach to. */
+  maxWalkM: 260,
+  /** A line needs at least this many stops to be worth anything. */
+  minStops: 2,
+  maxStops: 40,
+  maxLines: 24,
+};
 
 // ─── zoning ─────────────────────────────────────────────────────────────────
 

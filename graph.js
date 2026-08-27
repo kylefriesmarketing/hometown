@@ -11,7 +11,7 @@
 //    a real street grid. If the bake's coordinate rounding ever changes, this
 //    assumption changes with it — see test.mjs, which guards connectivity.
 
-import { ROAD_SPEED, ROAD_LANES, LANE_CAPACITY, BPR } from './data.js';
+import { ROAD_SPEED, ROAD_LANES, LANE_CAPACITY, BPR, TRANSIT, JUNCTION_DELAY, JUNCTION_MIN_DEGREE } from './data.js';
 
 const key = (x, z) => x.toFixed(1) + ',' + z.toFixed(1);
 
@@ -54,6 +54,19 @@ export class RoadGraph {
   constructor(world) {
     this.world = world;
     this._build(world);
+    // Everything built so far is the ROAD network and never changes. Transit is
+    // appended on top, so base edge indices 0..baseEdgeCount-1 stay stable and
+    // every per-edge array can simply be extended rather than remapped.
+    this.baseNodeCount = this.nodeCount;
+    this.baseEdgeCount = this.edgeCount;
+    this._base = {
+      nx: this.nx, nz: this.nz, ea: this.ea, eb: this.eb,
+      elen: this.elen, espeed: this.espeed, ecap: this.ecap,
+      eroad: this.eroad, freeTime: this.freeTime,
+    };
+    this.lines = [];
+    this.isTransit = new Uint8Array(this.edgeCount);
+
     this.load = new Float32Array(this.edgeCount);      // vehicles per hour, per edge
     // Two INDEPENDENT reasons an edge can be shut, kept apart on purpose: the
     // sea receding must not reopen a street the player closed, and reopening a
@@ -96,7 +109,7 @@ export class RoadGraph {
     };
 
     // ── pass 2: split each way at its junctions into edges ───────────────────
-    const ea = [], eb = [], elen = [], espeed = [], ecap = [], eroad = [];
+    const ea = [], eb = [], elen = [], espeed = [], ecap = [], eroad = [], ekind = [];
     for (let ri = 0; ri < drivable.length; ri++) {
       const r = drivable[ri];
       const n = r.pts.length / 2;
@@ -121,6 +134,7 @@ export class RoadGraph {
         if (a !== b && runLen > 0.5) {
           ea.push(a); eb.push(b); elen.push(runLen);
           espeed.push(speed); ecap.push(Math.max(200, cap)); eroad.push(drivableIdx[ri]);
+          ekind.push(r.k);
         }
         segStart = i; runLen = 0;
       }
@@ -138,15 +152,143 @@ export class RoadGraph {
     this.eroad = Int32Array.from(eroad);      // -> index into world.roads
     this.drivable = drivable;
     this.drivableIdx = Int32Array.from(drivableIdx);
-
-    // free-flow traversal time, minutes
-    this.freeTime = new Float32Array(this.edgeCount);
-    for (let e = 0; e < this.edgeCount; e++) {
-      this.freeTime[e] = this.elen[e] / (this.espeed[e] * 1000 / 60);
-    }
+    this.ekind = ekind;
 
     this._buildAdjacency();
+
+    // Free-flow traversal time = driving + the junctions at each end.
+    // ⚠️ Adjacency must exist first: junction cost depends on node DEGREE, and
+    // half of each endpoint's delay is charged to the edge so a through trip
+    // pays each intersection exactly once however it is split into edges.
+    const degree = n => this.adjStart[n + 1] - this.adjStart[n];
+    this.freeTime = new Float32Array(this.edgeCount);
+    for (let e = 0; e < this.edgeCount; e++) {
+      const drive = this.elen[e] / (this.espeed[e] * 1000 / 60);
+      const per = JUNCTION_DELAY[this.ekind[e]] ?? JUNCTION_DELAY.street;
+      let junction = 0;
+      if (degree(this.ea[e]) >= JUNCTION_MIN_DEGREE) junction += per / 2;
+      if (degree(this.eb[e]) >= JUNCTION_MIN_DEGREE) junction += per / 2;
+      this.freeTime[e] = drive + junction;
+    }
     this._buildNodeIndex();
+  }
+
+
+  /**
+   * Install a set of transit lines on top of the road network.
+   *
+   * Each stop becomes its own NODE, joined to the nearest street node by a short
+   * "access" edge whose cost is the wait — which is what naturally limits
+   * transit to people who can actually reach a stop. Consecutive stops are
+   * joined by a fast transit edge.
+   *
+   * ⚠️ Transit edges are APPENDED, never interleaved, so road edge indices are
+   * stable and every per-edge array (load, blocks, capacity) extends in place.
+   * The sim re-applies its own road and flood state afterwards.
+   *
+   * lines: [{ id, kind, stops: [[x,z], ...] }]
+   */
+  setTransit(lines) {
+    const b = this._base;
+    this.lines = lines || [];
+
+    const nx = Array.from(b.nx), nz = Array.from(b.nz);
+    const ea = Array.from(b.ea), eb = Array.from(b.eb);
+    const elen = Array.from(b.elen), espeed = Array.from(b.espeed);
+    const ecap = Array.from(b.ecap), eroad = Array.from(b.eroad);
+    const freeTime = Array.from(b.freeTime);
+    const isTransit = new Array(this.baseEdgeCount).fill(0);
+
+    // nearestNode must search only REAL street nodes, so do the lookups before
+    // any transit node exists.
+    const anchors = [];
+    for (const line of this.lines) {
+      anchors.push(line.stops.map(([x, z]) => this.nearestNode(x, z, TRANSIT.maxWalkM)));
+    }
+
+    this.stopNodes = [];
+    for (let li = 0; li < this.lines.length; li++) {
+      const line = this.lines[li];
+      const spec = TRANSIT.kinds[line.kind] || TRANSIT.kinds.tram;
+      const nodes = [];
+
+      for (let s = 0; s < line.stops.length; s++) {
+        const [x, z] = line.stops[s];
+        const id = nx.length;
+        nx.push(x); nz.push(z);
+        nodes.push(id);
+
+        // access edge: street <-> platform, costed as the wait
+        const anchor = anchors[li][s];
+        if (anchor >= 0) {
+          ea.push(anchor); eb.push(id);
+          elen.push(Math.hypot(this.nx[anchor] - x, this.nz[anchor] - z));
+          espeed.push(spec.speed); ecap.push(1e9); eroad.push(-1);
+          freeTime.push(spec.accessMin);
+          isTransit.push(1);
+        }
+      }
+
+      // running edges between consecutive stops
+      for (let s = 0; s + 1 < nodes.length; s++) {
+        const [x0, z0] = line.stops[s], [x1, z1] = line.stops[s + 1];
+        const len = Math.hypot(x1 - x0, z1 - z0);
+        ea.push(nodes[s]); eb.push(nodes[s + 1]);
+        elen.push(len); espeed.push(spec.speed); ecap.push(1e9); eroad.push(-1);
+        freeTime.push(len / (spec.speed * 1000 / 60) + spec.dwellMin);
+        isTransit.push(1);
+      }
+      this.stopNodes.push(nodes);
+    }
+
+    this.nodeCount = nx.length;
+    this.edgeCount = ea.length;
+    this.nx = Float32Array.from(nx); this.nz = Float32Array.from(nz);
+    this.ea = Int32Array.from(ea); this.eb = Int32Array.from(eb);
+    this.elen = Float32Array.from(elen); this.espeed = Float32Array.from(espeed);
+    this.ecap = Float32Array.from(ecap); this.eroad = Int32Array.from(eroad);
+    this.freeTime = Float32Array.from(freeTime);
+    this.isTransit = Uint8Array.from(isTransit);
+
+    // extend the per-edge arrays, preserving road entries
+    const grow = (old, fill = 0) => {
+      const next = new Float32Array(this.edgeCount).fill(fill);
+      if (old) next.set(old.subarray(0, Math.min(old.length, this.baseEdgeCount)));
+      return next;
+    };
+    const growU8 = old => {
+      const next = new Uint8Array(this.edgeCount);
+      if (old) next.set(old.subarray(0, Math.min(old.length, this.baseEdgeCount)));
+      return next;
+    };
+    this.load = grow(this.load);
+    this.capMul = grow(this.capMul, 1);
+    for (let e = this.baseEdgeCount; e < this.edgeCount; e++) this.capMul[e] = 1;
+    this.blockedFlood = growU8(this.blockedFlood);
+    this.blockedPlayer = growU8(this.blockedPlayer);
+    this._shut = new Uint8Array(this.edgeCount);
+    this._refreshShut();
+
+    this._dist = new Float32Array(this.nodeCount);
+    this._prevEdge = new Int32Array(this.nodeCount);
+    this._done = new Uint8Array(this.nodeCount);
+
+    this._buildAdjacency();
+    // ⚠️ The node index is REBUILT FROM BASE NODES ONLY. If platforms entered it,
+    // a later line would snap its access edge to another line's platform instead
+    // of to the street, and transit would quietly detach from the city.
+    this._buildNodeIndex(this.baseNodeCount);
+    return this;
+  }
+
+  /** Total route length per line, metres — for the UI and for upkeep. */
+  transitLengthOf(line) {
+    let m = 0;
+    for (let s = 0; s + 1 < line.stops.length; s++) {
+      m += Math.hypot(line.stops[s + 1][0] - line.stops[s][0],
+                      line.stops[s + 1][1] - line.stops[s][1]);
+    }
+    return m;
   }
 
   /** CSR adjacency. Streets are two-way for routing; oneway is a v2 refinement. */
@@ -167,13 +309,13 @@ export class RoadGraph {
   }
 
   /** Uniform bucket grid so nearestNode() is not a linear scan. */
-  _buildNodeIndex() {
+  _buildNodeIndex(limit = this.nodeCount) {
     const w = this.world;
     this._bucket = 60;
     this._gc = Math.ceil(w.width / this._bucket) + 1;
     this._gr = Math.ceil(w.depth / this._bucket) + 1;
     const idx = new Map();
-    for (let i = 0; i < this.nodeCount; i++) {
+    for (let i = 0; i < limit; i++) {
       const gi = Math.floor((this.nx[i] - w.x0) / this._bucket);
       const gj = Math.floor((this.nz[i] - w.z0) / this._bucket);
       const k = gj * this._gc + gi;
@@ -227,6 +369,9 @@ export class RoadGraph {
 
   /** Effective capacity after the player has widened or narrowed a street. */
   capacityOf(e) { return Math.max(120, this.ecap[e] * this.capMul[e]); }
+
+  /** Is this edge carried by rail rather than road? Cars never load these. */
+  isTransitEdge(e) { return this.isTransit[e] === 1; }
 
   /** Congested traversal time (minutes) for an edge, BPR volume-delay. */
   edgeTime(e) {
@@ -309,10 +454,15 @@ export class RoadGraph {
     let km = 0;
     for (let e = 0; e < this.edgeCount; e++) km += this.elen[e];
     const c = this.components();
+    let transitKm = 0, transitEdges = 0;
+    for (let e = this.baseEdgeCount; e < this.edgeCount; e++) {
+      if (this.isTransit[e]) { transitKm += this.elen[e]; transitEdges++; }
+    }
     return {
       nodes: this.nodeCount, edges: this.edgeCount,
       km: km / 1000,
       components: c.count, largestShare: c.largestShare,
+      lines: this.lines.length, transitEdges, transitKm: transitKm / 1000,
     };
   }
 }

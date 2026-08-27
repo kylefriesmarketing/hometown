@@ -14,10 +14,10 @@ Two free, key-less data sources — no Google, no API key, no per-request bill:
 
 ---
 
-## Status — M4: share links (2026-08-27)
+## Status — M5: transit (2026-08-27)
 
-**M1 (map), M2 (sim), M3 (streets) and M4 (sharing) are done and verified.**
-`node test.mjs && node test-sim.mjs` = **197 tests, all green**.
+**M1 (map) through M5 (transit) are done and verified.**
+`node test.mjs && node test-sim.mjs` = **231 tests, all green**.
 
 A **what-if sandbox**: no fail state, no score. You inherit a real town and you
 break it — flood it, rezone it, close streets, tear out the freeway — and watch
@@ -36,6 +36,9 @@ What works:
   **97-character URL** — and it reproduces byte-identically (verified: same
   `stateHash` on both sides, not merely a similar-looking city)
 - **hold ⟨C⟩ or the 👁 button** to see the real town underneath your changes
+- **transit**: pick bus / tram / metro, click stops along the map, press Finish.
+  Lines are laid over the real street network and people use them if — and only
+  if — they are actually faster
 
 **Measured on San Francisco** (476k people, 470 km of streets, 291 freeway
 segments including the real Central and James Lick Freeways):
@@ -48,10 +51,10 @@ segments including the real Central and James Lick Freeways):
 "Stranded" is people who can no longer reach any work by road — it is the number
 that actually moves, and it moves 37x.
 
-⚠️ **Commutes read low (3–4 min) and that is honest, not broken.** The flagship
-is a 4.4 km square. Real commutes are long because they cross a metro area; trips
-that leave the map cannot be modelled, so what you are seeing is genuinely the
-travel time *within this slice of the city*.
+⚠️ **Commutes read ~8 min, and that is travel time WITHIN this slice of the
+city.** The flagship is a 4.4 km square; real commutes are long because they
+cross a metro area, and trips that leave the map cannot be modelled. (Before
+`JUNCTION_DELAY` the figure was 3.5 min, which was simply wrong.)
 
 ⚠️ **There is no pressure, deliberately.** The treasury was removed from the HUD
 because in a sandbox with no fail state it only ever climbed and told the player
@@ -67,6 +70,31 @@ Baked worlds:
 | `san-francisco` ★ | 19 km² | 17,636 | 144 m | **flagship.** Downtown, SoMa, the freeways, the Bay |
 | `russian-hill` | 3.2 km² | 5,857 | 121 m | small, dense; loads fast |
 | `myrtle-beach` | 4.8 km² | 758 | 13 m | flat coastal sprawl; the best flood demo |
+
+### Transit, and why mode share is not a parameter
+
+Routing already picks the fastest path. So the only rule transit needs is: **a
+trip routed over transit adds no car to the road.** Mode share then emerges —
+build a line people would genuinely use and cars come off the streets by
+themselves. Measured on San Francisco:
+
+| | ridership | car load | congestion |
+|---|---|---|---|
+| free-flowing roads + one metro | 2.3% | −1.2% | 3.3% → 3.0% |
+| **congested roads + the same metro** | **3.8%** | **−2.7%** | 4.1% → 3.9% |
+
+Ridership rises when the roads get worse. Nothing declares that; it falls out.
+
+⚠️ **Getting here required admitting the cars were wrong, not the transit.**
+The first working version had **0 of 38,423 trips** choose a metro, and it was
+right to: a car crossed San Francisco at an effective **47.5 km/h** door to
+door, because crossing an intersection was free. Real core-city speeds are
+20–25 km/h and the entire difference is signals, stops and turns.
+`JUNCTION_DELAY` charges for them, weighted by node degree so a well-mapped
+straight road is not taxed for being split into many ways. Cars now cross at
+**24.8 km/h**, a metro at 26.9 km/h, and the choice becomes real. Commutes
+across the flagship went from 3.5 min to about 7.8 min — the old number was
+never realistic.
 
 ---
 
@@ -120,6 +148,7 @@ Strict separation, so the sim can arrive without touching the renderer:
 | `data.js` | ALL tuning | balance changes go here and nowhere else |
 | `palette.js` | how the city is coloured | pure data |
 | `share.js` | the command log, and city↔URL | pure; the log IS the share link |
+| `graph.setTransit()` | the transit layer | edges APPENDED, so road indices stay stable |
 | `game.js` | play layer: HUD, overlays, selection, clock | `issue()` is the ONLY route to the sim |
 | `main.js` | boot, input, frame loop | — |
 | `tools/bake.mjs` | the pipeline | bake-time only |
@@ -225,7 +254,25 @@ Strict separation, so the sim can arrive without touching the renderer:
     creating the log after the builders threw on construction and the game never
     booted at all. Same class as a TDZ trap: armed by content, not by syntax.
 
-17. **Reload between destructive probes.** A probe that swaps a material and
+17. **A −1 sentinel meets an array index.** Transit edges carry `eroad === -1`,
+    and `_applyRoads` did `roadState[-1]` → `undefined` → `undefined === 0` is
+    false → **every transit edge was silently marked CLOSED**, with `capMul`
+    set to NaN. The lines existed, were correctly shaped and connected, and were
+    simply unreachable: 0 of 38,423 trips could use them and nothing reported an
+    error. Guarded by a test that asserts no transit edge is ever shut.
+
+18. **Transit edges are APPENDED, never interleaved.** Road edge indices stay
+    stable, so every per-edge array (load, blocks, capacity) extends in place.
+    But `setTransit()` reallocates them all, so the sim must re-apply road and
+    flood state afterwards — laying a tram line would otherwise reopen every
+    street the player closed. Order: transit, then roads, then flood.
+
+19. **The transit node index excludes platforms.** `_buildNodeIndex` is rebuilt
+    over base nodes only; if platforms entered it, a later line would snap its
+    access edge to another line's platform instead of to the street, and transit
+    would quietly detach from the city.
+
+20. **Reload between destructive probes.** A probe that swaps a material and
    leaves it swapped means the next measurement is measuring the probe.
 
 ---

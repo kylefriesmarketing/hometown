@@ -14,7 +14,7 @@
 
 import {
   TICK, ZONES, ZONE_KINDS, ZONE_INDEX, SIM, DESIRE, FALLOFF, SLOPE_HALF,
-  SERVICES, REZONE_COST_PER_M2, DEMOLISH_COST_PER_M2,
+  SERVICES, REZONE_COST_PER_M2, DEMOLISH_COST_PER_M2, TRANSIT,
 } from './data.js';
 import { chamferFrom, sampleField, stampPoint, floodFromEdges, maskAt } from './field.js';
 
@@ -23,6 +23,9 @@ const Z_RES = ZONE_INDEX.residential;
 const Z_COM = ZONE_INDEX.commercial;
 const Z_IND = ZONE_INDEX.industrial;
 const Z_CIV = ZONE_INDEX.civic;
+
+/** Fold a possibly-negative integer into the hash without losing its sign. */
+const zigOf = n => ((n << 1) ^ (n >> 31)) >>> 0;
 
 /** Half-life decay: 1 at d=0, 0.5 at d=half, asymptotically 0. */
 const decay = (d, half) => 1 / (1 + (d / half) * (d / half));
@@ -75,6 +78,11 @@ export class Sim {
     this.roadState = new Uint8Array(world.roads.length);
     this.roadLanes = new Float32Array(world.roads.length).fill(1);  // capacity multiplier
     this._applyRoads();
+
+    // Transit lines the player has drawn. The graph owns the edges; this owns
+    // the authoritative list, so it is what gets saved, hashed and shared.
+    this.transit = [];
+    this.nextLineId = 1;
 
     this._rebuildFlood();
 
@@ -200,6 +208,7 @@ export class Sim {
     this.zoneJobs = new Float32Array(nz);
     this.zoneAccess = new Float32Array(nz);
     this.zoneCommute = new Float32Array(nz);   // mean minutes to work, per zone
+    this.zoneTransit = new Float32Array(nz);   // share of trips that ride, per zone
     this.zoneNode = new Int32Array(nz).fill(-1);
     for (let j = 0; j < this.zRows; j++) {
       for (let i = 0; i < this.zCols; i++) {
@@ -239,6 +248,9 @@ export class Sim {
     const g = this.graph;
     let cutEdges = 0;
     for (let e = 0; e < g.edgeCount; e++) {
+      // Transit is assumed to be built above or below the water; drowning it
+      // as well would make a flood unsurvivable in a way no real city is.
+      if (g.isTransit && g.isTransit[e]) { this.floodedE[e] = 0; continue; }
       const mx = (g.nx[g.ea[e]] + g.nx[g.eb[e]]) / 2;
       const mz = (g.nz[g.ea[e]] + g.nz[g.eb[e]]) / 2;
       const under = maskAt(this.floodMask, w.cols, w.rows, w.cell, w.x0, w.z0, mx, mz)
@@ -262,6 +274,12 @@ export class Sim {
     const blocked = new Uint8Array(g.edgeCount);
     for (let e = 0; e < g.edgeCount; e++) {
       const r = g.eroad[e];
+      // ⚠️ A TRANSIT EDGE HAS eroad === -1 AND MUST BE SKIPPED. Indexing
+      // roadState[-1] yields undefined, `undefined === 0` is false, and every
+      // transit edge was silently marked CLOSED — while capMul became NaN.
+      // The lines existed, were correctly shaped, and were simply unreachable:
+      // 0 of 38,423 trips could use them and nothing said why.
+      if (r < 0) { blocked[e] = 0; g.capMul[e] = 1; continue; }
       blocked[e] = this.roadState[r] === 0 ? 0 : 1;
       g.capMul[e] = this.roadLanes[r];
     }
@@ -334,7 +352,7 @@ export class Sim {
     const g = this.graph;
     const from = this.zoneNode[z];
     const workers = this.zonePop[z] * SIM.workforceShare;
-    if (from < 0) { this.zoneAccess[z] = 0; this.zoneCommute[z] = 0; return; }
+    if (from < 0) { this.zoneAccess[z] = 0; this.zoneCommute[z] = 0; this.zoneTransit[z] = 0; return; }
 
     const dist = g.dijkstra(from, SIM.commuteHorizon);
 
@@ -370,13 +388,25 @@ export class Sim {
 
     // vehicles/hour at peak, distributed along each shortest path
     const vehicles = workers * SIM.carShare / SIM.occupantsPerCar * SIM.peakShare;
+    let rode = 0, tripW = 0;
     for (let k = 0; k < weights.length; k += 3) {
       const share = weights[k + 1] / reach;
       const flow = vehicles * share;
       if (flow < 0.01) continue;
       g.pathEdges(from, weights[k + 2], path);
-      for (const e of path) this._nextLoad[e] += flow;
+      // ⚠️ THE RULE THAT MAKES MODE SHARE EMERGE: a trip routed over transit
+      // adds NO CAR to the road. Routing already picks whichever path is
+      // faster, so building a good line takes cars off the streets by itself —
+      // no mode-choice model, no extra parameter to tune.
+      let usedTransit = false;
+      for (const e of path) {
+        if (g.isTransit[e]) usedTransit = true;
+        else this._nextLoad[e] += flow;
+      }
+      if (usedTransit) rode += weights[k + 1];
+      tripW += weights[k + 1];
     }
+    this.zoneTransit[z] = tripW > 0 ? rode / tripW : 0;
   }
 
   /** Refresh desirability and occupancy for a slice of buildings. */
@@ -560,6 +590,17 @@ export class Sim {
     }
     s.commute = cw > 0 ? ct / cw : 0;
     s.stranded = stranded;
+
+    let rw = 0, rt = 0, tkm = 0;
+    for (let z = 0; z < this.nZones; z++) {
+      const pop = this.zonePop[z];
+      if (pop <= 0) continue;
+      rt += this.zoneTransit[z] * pop; rw += pop;
+    }
+    for (const line of this.transit) tkm += this.graph.transitLengthOf(line) / 1000;
+    s.transitShare = rw > 0 ? rt / rw : 0;
+    s.transitLines = this.transit.length;
+    s.transitKm = tkm;
     s.seaLevel = this.seaLevel;
     this.stats = s;
     return s;
@@ -589,6 +630,7 @@ export class Sim {
       case 'demolish': return this._cmdDemolish(cmd);
       case 'sea': return this._cmdSea(cmd);
       case 'road': return this._cmdRoad(cmd);
+      case 'transit': return this._cmdTransit(cmd);
       default: return { ok: false, reason: `unknown command "${cmd.t}"` };
     }
   }
@@ -682,6 +724,75 @@ export class Sim {
     return { ok: true, count: changed, op: cmd.op };
   }
 
+
+  /**
+   * Lay or lift a transit line.
+   *
+   * Stops are quantised to whole metres so a line drawn by a mouse encodes
+   * compactly and reproduces exactly from a share link.
+   */
+  _cmdTransit(cmd) {
+    if (cmd.op === 'add') {
+      if (this.transit.length >= TRANSIT.maxLines) {
+        return { ok: false, reason: `that is already ${TRANSIT.maxLines} lines` };
+      }
+      const spec = TRANSIT.kinds[cmd.kind];
+      if (!spec) return { ok: false, reason: `no such transit kind "${cmd.kind}"` };
+
+      const stops = (cmd.stops || [])
+        .slice(0, TRANSIT.maxStops)
+        .map(p => [Math.round(p[0]), Math.round(p[1])])
+        .filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+      if (stops.length < TRANSIT.minStops) {
+        return { ok: false, reason: `a line needs at least ${TRANSIT.minStops} stops` };
+      }
+
+      const line = { id: this.nextLineId++, kind: cmd.kind, stops };
+      this.transit.push(line);
+      this._applyTransit();
+      return { ok: true, id: line.id, stops: stops.length,
+               km: this.graph.transitLengthOf(line) / 1000 };
+    }
+
+    if (cmd.op === 'remove') {
+      const before = this.transit.length;
+      this.transit = this.transit.filter(l => l.id !== cmd.id);
+      if (this.transit.length === before) return { ok: false, reason: 'no such line' };
+      this._applyTransit();
+      return { ok: true, id: cmd.id };
+    }
+
+    if (cmd.op === 'clear') {
+      if (!this.transit.length) return { ok: false, reason: 'there are no lines' };
+      const n = this.transit.length;
+      this.transit = [];
+      this._applyTransit();
+      return { ok: true, count: n };
+    }
+
+    return { ok: false, reason: `unknown transit op "${cmd.op}"` };
+  }
+
+  /**
+   * Rebuild the graph's transit layer and put the road state back on top of it.
+   *
+   * ⚠️ setTransit() reallocates every per-edge array, so the sim's own road
+   * blocking and flooding MUST be re-applied afterwards — otherwise laying a
+   * tram line quietly reopens every street the player closed and un-floods the
+   * city. Order matters: transit, then roads, then flood.
+   */
+  _applyTransit() {
+    this.graph.setTransit(this.transit);
+    this.floodedE = new Uint8Array(this.graph.edgeCount);
+    this._nextLoad = new Float32Array(this.graph.edgeCount);
+    this._applyRoads();
+    this._rebuildFlood();
+    this._aggregateZones();
+    this._fullTrafficPass();
+    for (let i = 0; i < this.n; i++) this._updateDesire(i);
+    this._recomputeTotals();
+  }
+
   // ── save / load / hash ───────────────────────────────────────────────────
 
   /**
@@ -702,6 +813,8 @@ export class Sim {
       day: this.day, money: this.money, bankrupt: this.bankrupt,
       seaLevel: this.seaLevel,
       zone: Array.from(this.zone),
+      transit: this.transit.map(l => ({ id: l.id, kind: l.kind, stops: l.stops.map(p => [p[0], p[1]]) })),
+      nextLineId: this.nextLineId,
       roadState: Array.from(this.roadState),
       roadLanes: Array.from(this.roadLanes),
       occ: Array.from(this.occ),
@@ -734,6 +847,14 @@ export class Sim {
     this.seaLevel = s.seaLevel ?? 0;
     this.zone.set(s.zone);
     this.occ.set(s.occ);
+    // ⚠️ Transit FIRST: it resizes every per-edge array, so restoring road and
+    // flood state before it would write into arrays that are about to be thrown
+    // away. This ordering is load-bearing.
+    this.transit = (s.transit || []).map(l => ({ id: l.id, kind: l.kind, stops: l.stops.map(p => [p[0], p[1]]) }));
+    this.nextLineId = s.nextLineId || (this.transit.reduce((m, l) => Math.max(m, l.id), 0) + 1);
+    this.graph.setTransit(this.transit);
+    this.floodedE = new Uint8Array(this.graph.edgeCount);
+    this._nextLoad = new Float32Array(this.graph.edgeCount);
     if (s.roadState) this.roadState.set(s.roadState);
     if (s.roadLanes) this.roadLanes.set(s.roadLanes);
     this._bCursor = s.bCursor | 0;
@@ -788,6 +909,11 @@ export class Sim {
     for (let i = 0; i < this.n; i++) mix(Math.round(this.desire[i] * 1000));
     for (let z = 0; z < this.nZones; z++) mix(Math.round(this.zoneAccess[z] * 1000));
     for (let z = 0; z < this.nZones; z++) mix(Math.round(this.zoneCommute[z] * 1000));
+    for (const line of this.transit) {
+      mix(line.id * 7 + 1);
+      mix((line.kind.charCodeAt(0) || 1) * 31);
+      for (const [x, z] of line.stops) { mix(zigOf(x)); mix(zigOf(z)); }
+    }
     for (let e = 0; e < this.graph.edgeCount; e++) {
       mix(Math.round(this.graph.load[e] * 1000));
       mix(Math.round(this._nextLoad[e] * 1000));

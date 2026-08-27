@@ -14,6 +14,7 @@ import {
   hash01, wallColour, roofColour, GROUND, SKY, SUN, AMBIENT, FILL,
   FOLIAGE, TRUNK, TREE_DENSITY,
 } from './palette.js';
+import { TRANSIT } from './data.js';
 
 // Vertical layering — small, fixed offsets so draped surfaces never z-fight.
 // ⚠️ `foot` sits BELOW `road` on purpose. A well-mapped city tags every
@@ -615,6 +616,91 @@ export class View {
     this.scene.add(this.water);
     this.invalidateShadows();
     return cells;
+  }
+
+
+  /**
+   * Transit lines, drawn ABOVE the buildings.
+   *
+   * A line is infrastructure the player placed, not part of the map, so it
+   * deliberately does not drape or hide behind anything — it rides over the
+   * city at a fixed height with depth testing off, the way a diagram would.
+   */
+  buildTransit(lines) {
+    if (this.transitGroup) {
+      this.scene.remove(this.transitGroup);
+      this.transitGroup.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+    }
+    this.transitGroup = new THREE.Group();
+    this.transitGroup.renderOrder = 900;
+    this.scene.add(this.transitGroup);
+    if (!lines || !lines.length) return 0;
+
+    const w = this.world;
+    for (const line of lines) {
+      const spec = TRANSIT.kinds[line.kind] || TRANSIT.kinds.tram;
+      this._addLineMesh(line.stops, spec, 1);
+      void w;
+    }
+    this.invalidateShadows();
+    return lines.length;
+  }
+
+  /** The line currently being drawn, shown translucent until it is finished. */
+  setDraftLine(draft) {
+    if (this.draftGroup) {
+      this.scene.remove(this.draftGroup);
+      this.draftGroup.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+      this.draftGroup = null;
+    }
+    if (!draft || !draft.stops.length) return;
+    const spec = TRANSIT.kinds[draft.kind] || TRANSIT.kinds.tram;
+    this.draftGroup = new THREE.Group();
+    this.draftGroup.renderOrder = 901;
+    this.scene.add(this.draftGroup);
+    this._addLineMesh(draft.stops, spec, 0.55, this.draftGroup);
+  }
+
+  _addLineMesh(stops, spec, opacity, group = this.transitGroup) {
+    const w = this.world;
+    const LIFT = 14;                     // metres above the ground, clear of most roofs
+    const y = (x, z) => w.heightAt(x, z) + LIFT;
+
+    // the ribbon
+    if (stops.length >= 2) {
+      const flat = stops.flat();
+      const { left, right } = ribbon(flat, spec.width);
+      const pos = [];
+      for (let i = 0; i < stops.length - 1; i++) {
+        const l0 = [left[i * 2], left[i * 2 + 1]], r0 = [right[i * 2], right[i * 2 + 1]];
+        const l1 = [left[(i + 1) * 2], left[(i + 1) * 2 + 1]], r1 = [right[(i + 1) * 2], right[(i + 1) * 2 + 1]];
+        pos.push(
+          l0[0], y(...l0), l0[1], l1[0], y(...l1), l1[1], r0[0], y(...r0), r0[1],
+          r0[0], y(...r0), r0[1], l1[0], y(...l1), l1[1], r1[0], y(...r1), r1[1]
+        );
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      geo.computeVertexNormals();
+      group.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+        color: spec.colour, transparent: true, opacity,
+        depthTest: false, side: THREE.DoubleSide,
+      })));
+    }
+
+    // a marker per stop
+    const stopGeo = new THREE.CylinderGeometry(spec.width * 0.9, spec.width * 0.9, 2.5, 10);
+    const stopMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: Math.min(1, opacity + 0.2), depthTest: false,
+    });
+    const marks = new THREE.InstancedMesh(stopGeo, stopMat, stops.length);
+    const mtx = new THREE.Matrix4();
+    stops.forEach(([x, z], i) => {
+      mtx.makeTranslation(x, y(x, z) + 1.6, z);
+      marks.setMatrixAt(i, mtx);
+    });
+    marks.instanceMatrix.needsUpdate = true;
+    group.add(marks);
   }
 
   // ─── colouring ────────────────────────────────────────────────────────────

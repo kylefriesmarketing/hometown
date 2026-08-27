@@ -126,7 +126,9 @@
   #tools button:disabled { opacity: .4; cursor: default; }
   #tools .hintline { font-size: 11px; color: var(--dim); margin-top: 3px; }
 
-  #sel-info, #sea-info, #road-info { font-size: 11.5px; color: var(--dim); min-height: 15px; }
+  #sel-info, #sea-info, #road-info, #transit-info { font-size: 11.5px; color: var(--dim); min-height: 15px; }
+  #transit-info b { color: var(--text); }
+  #tools button.drawing { background: var(--good); color: #0d1218; border-color: var(--good); font-weight: 650; }
   #road-info b { color: var(--text); }
   #tools button.danger { border-color: rgba(255,155,155,.45); color: #ffc9c9; }
   #tools button.wide { grid-column: span 2; }
@@ -206,6 +208,11 @@
       <div class="row" id="overlay-row"></div>
       <div id="legend"><div class="bar" id="legend-bar"></div>
         <div class="ends"><span id="legend-lo"></span><span id="legend-hi"></span></div></div>
+    </div>
+    <div class="group">
+      <div class="glabel">Transit</div>
+      <div class="row" id="transit-row"></div>
+      <div id="transit-info">pick a mode, then click along the map</div>
     </div>
     <div class="group">
       <div class="glabel">Sea level</div>

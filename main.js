@@ -69,7 +69,8 @@ async function loadWorld(name) {
       const res = applyShare(sim, shared);
       // The guest inherits the author's log, so re-sharing keeps the history.
       for (const e of shared.entries) game.log.record(e.day, e.cmd);
-      game.refreshHud(); game.refreshRoads(); game.refreshSelection();
+      view.buildTransit(sim.transit);
+      game.refreshHud(); game.refreshRoads(); game.refreshSelection(); game.refreshTransit();
       if (sim.seaLevel !== 0) {
         view.buildWater(sim.floodMask, sim.seaLevel);
         const slider = document.getElementById('sea-slider');
@@ -132,7 +133,9 @@ canvas.addEventListener('pointerup', e => {
     const ny = -((e.clientY - r.top) / r.height) * 2 + 1;
     try {
       const hit = view.pick(nx, ny);
-      if (hit && hit.roadIndex >= 0) game.selectRoad(hit.roadIndex, e.shiftKey);
+      // While a line is being drawn, a click places a stop instead of selecting.
+      if (hit && game.addStop(hit.x, hit.z)) { /* handled */ }
+      else if (hit && hit.roadIndex >= 0) game.selectRoad(hit.roadIndex, e.shiftKey);
       else game.select(hit && hit.building ? hit.index : -1, e.shiftKey);
     } catch (err) { console.warn('pick failed', err); }
   }
@@ -188,7 +191,8 @@ addEventListener('keydown', e => {
   keys[e.key.toLowerCase()] = true;
   if (e.key === 'Tab') e.preventDefault();
   if (!game) return;
-  if (e.key === 'Escape') game.clearSelection();
+  if (e.key === 'Escape') { game.cancelLine(); game.clearSelection(); }
+  if (e.key === 'Enter') game.finishLine();
   if (e.key.toLowerCase() === 'c' && !e.repeat) game.setCompare(true);
   if (e.key === ' ') { e.preventDefault(); game.setSpeed(game.speed === 0 ? 1 : 0); }
   if (e.key >= '1' && e.key <= '4') game.setSpeed(+e.key - 1);

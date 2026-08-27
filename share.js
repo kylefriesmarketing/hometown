@@ -26,8 +26,9 @@ import { ZONE_KINDS, ZONE_INDEX } from './data.js';
 const MAGIC = [0x48, 0x54];   // 'HT'
 const VERSION = 2;
 
-const OP = { REZONE: 1, ROAD: 2, SEA: 3 };
+const OP = { REZONE: 1, ROAD: 2, SEA: 3, TRANSIT_ADD: 4, TRANSIT_DEL: 5, TRANSIT_CLEAR: 6 };
 const ROAD_OPS = ['close', 'open', 'widen', 'narrow', 'remove'];
+const TRANSIT_KINDS = ['bus', 'tram', 'metro'];
 
 export const MAX_REPLAY_DAYS = 1200;
 /** A link should never carry more edits than a person plausibly made. */
@@ -115,6 +116,24 @@ export function encodeBytes(world, finalDay, log) {
     } else if (cmd.t === 'sea') {
       out.push(OP.SEA);
       putVarint(out, zig(Math.round(cmd.level * 10)));
+    } else if (cmd.t === 'transit') {
+      if (cmd.op === 'add') {
+        out.push(OP.TRANSIT_ADD, Math.max(0, TRANSIT_KINDS.indexOf(cmd.kind)));
+        putVarint(out, cmd.stops.length);
+        // Stops are delta-encoded against the PREVIOUS stop: a drawn line moves
+        // in short hops, so each coordinate costs a byte or two instead of four.
+        let px = 0, pz = 0;
+        for (const [x, z] of cmd.stops) {
+          const rx = Math.round(x), rz = Math.round(z);
+          putVarint(out, zig(rx - px)); putVarint(out, zig(rz - pz));
+          px = rx; pz = rz;
+        }
+      } else if (cmd.op === 'remove') {
+        out.push(OP.TRANSIT_DEL);
+        putVarint(out, cmd.id);
+      } else {
+        out.push(OP.TRANSIT_CLEAR);
+      }
     } else if (cmd.t === 'demolish') {
       // demolish is a rezone to 'none' — one opcode fewer to get wrong
       out.push(OP.REZONE, ZONE_INDEX.none);
@@ -158,6 +177,21 @@ export function decodeBytes(buf) {
       entries.push({ day, cmd: { t: 'road', op: ROAD_OPS[oi] ?? 'close', ids: getIds(buf, cur) } });
     } else if (op === OP.SEA) {
       entries.push({ day, cmd: { t: 'sea', level: unzig(getVarint(buf, cur)) / 10 } });
+    } else if (op === OP.TRANSIT_ADD) {
+      const kind = TRANSIT_KINDS[buf[cur.i++]] ?? 'tram';
+      const n = getVarint(buf, cur);
+      if (n > 256) throw new Error('share code has an implausible transit line');
+      const stops = [];
+      let px = 0, pz = 0;
+      for (let s = 0; s < n; s++) {
+        px += unzig(getVarint(buf, cur)); pz += unzig(getVarint(buf, cur));
+        stops.push([px, pz]);
+      }
+      entries.push({ day, cmd: { t: 'transit', op: 'add', kind, stops } });
+    } else if (op === OP.TRANSIT_DEL) {
+      entries.push({ day, cmd: { t: 'transit', op: 'remove', id: getVarint(buf, cur) } });
+    } else if (op === OP.TRANSIT_CLEAR) {
+      entries.push({ day, cmd: { t: 'transit', op: 'clear' } });
     } else {
       throw new Error(`unknown opcode ${op} in share code`);
     }

@@ -9,7 +9,7 @@ import { World } from './world.js';
 import { RoadGraph } from './graph.js';
 import { Sim } from './sim.js';
 import { chamfer, chamferFrom, sampleField, stampPolyline, floodFromEdges } from './field.js';
-import { ZONE_INDEX } from './data.js';
+import { ZONE_INDEX, TRANSIT, JUNCTION_DELAY } from './data.js';
 import { wallColour, roofColour, hash01 } from './palette.js';
 import {
   encodeBytes, decodeBytes, toBase64Url, fromBase64Url,
@@ -508,6 +508,195 @@ function gridTown({ span = 4, block = 100, pad = 0 } = {}) {
   ok('a city with edited streets stays in step', sim.stateHash() === sim2.stateHash());
 }
 
+
+
+// ── transit ────────────────────────────────────────────────────────────────
+
+// junction delay: the thing that makes cars realistic
+{
+  const w = gridTown({ span: 6, block: 120 });
+  const g = new RoadGraph(w);
+  // a grid has real 4-way junctions, so free-flow time must exceed pure driving
+  let withDelay = 0, pureDrive = 0;
+  for (let e = 0; e < g.edgeCount; e++) {
+    withDelay += g.freeTime[e];
+    pureDrive += g.elen[e] / (g.espeed[e] * 1000 / 60);
+  }
+  ok('junctions cost time', withDelay > pureDrive * 1.05,
+     `${withDelay.toFixed(1)} vs ${pureDrive.toFixed(1)} min`);
+  ok('a motorway pays no junction delay', JUNCTION_DELAY.highway === 0);
+}
+
+// laying and lifting a line
+{
+  const w = gridTown({ span: 6, block: 120 });
+  const sim = new Sim(w, new RoadGraph(w), { seed: 15 });
+  const g = sim.graph;
+  const baseEdges = g.baseEdgeCount;
+
+  ok('a fresh city has no transit', sim.transit.length === 0 && g.edgeCount === baseEdges);
+
+  const stops = [[-300, -300], [-150, -150], [0, 0], [150, 150], [300, 300]];
+  const r = sim.execCommand({ t: 'transit', op: 'add', kind: 'metro', stops });
+  ok('a line can be laid', r.ok && r.stops === 5, JSON.stringify(r));
+  ok('the graph grew', g.edgeCount > baseEdges, `${baseEdges} -> ${g.edgeCount}`);
+  ok('road edge indices are unchanged', g.baseEdgeCount === baseEdges);
+  ok('every new edge is flagged transit',
+     Array.from(g.isTransit.subarray(baseEdges)).every(v => v === 1));
+  ok('road edges are NOT flagged transit',
+     !Array.from(g.isTransit.subarray(0, baseEdges)).some(v => v === 1));
+
+  // ⚠️ THE BUG THIS GUARDS: transit edges carry eroad === -1, and _applyRoads
+  // indexed roadState[-1] -> undefined -> "not 0" -> every transit edge marked
+  // CLOSED, with capMul NaN. The lines existed, were shaped correctly, and were
+  // simply unreachable. Nothing reported an error.
+  ok('transit edges are not blocked', (() => {
+    for (let e = baseEdges; e < g.edgeCount; e++) if (g._shut[e]) return false;
+    return true;
+  })(), 'transit was silently closed by the road pass');
+  ok('transit capacity is a real number', (() => {
+    for (let e = baseEdges; e < g.edgeCount; e++) {
+      if (!Number.isFinite(g.capMul[e]) || !Number.isFinite(g.capacityOf(e))) return false;
+    }
+    return true;
+  })(), 'capMul went NaN for transit edges');
+
+  // platforms must actually be reachable from the street
+  const street = g.nearestNode(-300, -300);
+  const plat = g.stopNodes[0][0];
+  const dist = g.dijkstra(street);
+  ok('a platform is reachable from the street', Number.isFinite(dist[plat]),
+     String(dist[plat]));
+  ok('boarding costs the access time',
+     near(dist[plat], TRANSIT.kinds.metro.accessMin, 1e-3), String(dist[plat]));
+
+  // riding the line must beat walking the graph between distant stops
+  const farPlat = g.stopNodes[0][4];
+  ok('the line is faster than not having it', dist[farPlat] < dist[plat] + 30,
+     String(dist[farPlat]));
+
+  const rm = sim.execCommand({ t: 'transit', op: 'remove', id: r.id });
+  ok('a line can be lifted', rm.ok && sim.transit.length === 0);
+  ok('the graph shrank back', g.edgeCount === baseEdges);
+
+  ok('an unknown kind is rejected',
+     sim.execCommand({ t: 'transit', op: 'add', kind: 'hovercraft', stops }).ok === false);
+  ok('a one-stop line is rejected',
+     sim.execCommand({ t: 'transit', op: 'add', kind: 'tram', stops: [[0, 0]] }).ok === false);
+  ok('an unknown op is rejected',
+     sim.execCommand({ t: 'transit', op: 'wat' }).ok === false);
+  ok('removing a line that is not there is rejected',
+     sim.execCommand({ t: 'transit', op: 'remove', id: 999 }).ok === false);
+}
+
+// ⚠️ laying a line must not undo street surgery or a flood
+{
+  const w = gridTown({ span: 6, block: 120 });
+  const hh = new Float32Array(w.cols * w.rows);
+  for (let j = 0; j < w.rows; j++) {
+    for (let i = 0; i < w.cols; i++) hh[j * w.cols + i] = (i - w.cols / 2) * 0.6;
+  }
+  w.heights = hh; w.minH = hh[0]; w.maxH = hh[w.cols - 1];
+  for (const b of w.buildings) { b.gm = w.heightAt(b.c[0], b.c[1]); b.gx = b.gm; }
+
+  const sim = new Sim(w, new RoadGraph(w), { seed: 6 });
+  const g = sim.graph;
+  const closed = [...new Set(Array.from(g.eroad))].filter(r => r >= 0)[0];
+  sim.execCommand({ t: 'road', ids: [closed], op: 'close' });
+  sim.execCommand({ t: 'sea', level: 5 });
+
+  const blockedBefore = Array.from(g.blockedPlayer).filter(Boolean).length;
+  const floodedBefore = Array.from(g.blockedFlood).filter(Boolean).length;
+  ok('the city starts with closures and a flood', blockedBefore > 0 && floodedBefore > 0);
+
+  sim.execCommand({ t: 'transit', op: 'add', kind: 'tram',
+                    stops: [[-300, -300], [0, 0], [300, 300]] });
+
+  ok('laying a line keeps streets closed',
+     Array.from(g.blockedPlayer).filter(Boolean).length === blockedBefore,
+     `${Array.from(g.blockedPlayer).filter(Boolean).length} vs ${blockedBefore}`);
+  ok('laying a line keeps the flood',
+     Array.from(g.blockedFlood).filter(Boolean).length === floodedBefore,
+     `${Array.from(g.blockedFlood).filter(Boolean).length} vs ${floodedBefore}`);
+  ok('transit itself is not flooded', (() => {
+    for (let e = g.baseEdgeCount; e < g.edgeCount; e++) if (g.blockedFlood[e]) return false;
+    return true;
+  })());
+}
+
+// mode share must EMERGE, not be declared
+{
+  // The town must be big enough for transit to WIN, which is the real
+  // condition rather than a test convenience: across 1.2 km a metro (6.7 min)
+  // barely ties a car (6.9 min) and picks up no riders at all. Across 2.4 km
+  // the gap is decisive, which is exactly why real transit serves long trips.
+  const mk = () => {
+    const w = gridTown({ span: 12, block: 200 });
+    const s = new Sim(w, new RoadGraph(w), { seed: 31 });
+    for (let i = 0; i < 200; i++) s.tick();
+    return s;
+  };
+  const carLoad = s => {
+    let t = 0;
+    for (let e = 0; e < s.graph.edgeCount; e++) if (!s.graph.isTransit[e]) t += s.graph.load[e];
+    return t;
+  };
+
+  const a = mk();
+  ok('nobody rides a city with no transit', a.stats.transitShare === 0);
+  const carsBefore = carLoad(a);
+
+  const stops = [];
+  for (let k = 0; k <= 12; k++) stops.push([-1200 + k * 200, -1200 + k * 200]);
+  a.execCommand({ t: 'transit', op: 'add', kind: 'metro', stops });
+  for (let i = 0; i < 200; i++) a.tick();
+
+  ok('a metro line attracts riders', a.stats.transitShare > 0,
+     `${(a.stats.transitShare * 100).toFixed(2)}%`);
+  // ⚠️ the rule that makes mode share emerge: a transit trip adds no car
+  ok('riders come off the road', carLoad(a) < carsBefore,
+     `${Math.round(carLoad(a))} vs ${Math.round(carsBefore)}`);
+  ok('no car load is ever put on a transit edge', (() => {
+    for (let e = 0; e < a.graph.edgeCount; e++) {
+      if (a.graph.isTransit[e] && a.graph.load[e] > 1e-6) return false;
+    }
+    return true;
+  })());
+  ok('stats report the line', a.stats.transitLines === 1 && a.stats.transitKm > 0,
+     JSON.stringify({ lines: a.stats.transitLines, km: a.stats.transitKm }));
+}
+
+// determinism, save and hash
+{
+  const mk = () => {
+    const w = gridTown({ span: 6, block: 120 });
+    return new Sim(w, new RoadGraph(w), { seed: 77 });
+  };
+  const stops = [[-300, -300], [-100, 0], [100, 100], [300, 300]];
+
+  const a = mk(), b = mk();
+  for (const s of [a, b]) {
+    for (let i = 0; i < 40; i++) s.tick();
+    s.execCommand({ t: 'transit', op: 'add', kind: 'tram', stops });
+    for (let i = 0; i < 60; i++) s.tick();
+  }
+  ok('transit is deterministic', a.stateHash() === b.stateHash(),
+     `${a.stateHash()} vs ${b.stateHash()}`);
+
+  const noLine = mk();
+  for (let i = 0; i < 100; i++) noLine.tick();
+  ok('a line changes the hash', a.stateHash() !== noLine.stateHash());
+
+  const snap = JSON.parse(JSON.stringify(a.snapshot()));
+  const c = mk();
+  c.restore(snap);
+  ok('transit survives a save', c.transit.length === 1 && c.transit[0].kind === 'tram');
+  ok('a city with transit round-trips', c.stateHash() === a.stateHash(),
+     `${c.stateHash()} vs ${a.stateHash()}`);
+  ok('the restored graph has the line', c.graph.edgeCount === a.graph.edgeCount);
+  for (let i = 0; i < 40; i++) { a.tick(); c.tick(); }
+  ok('a restored city with transit stays in step', c.stateHash() === a.stateHash());
+}
 
 // ── share codes ────────────────────────────────────────────────────────────
 

@@ -4,7 +4,7 @@
 // It never writes sim state directly — every mutation goes through
 // `sim.execCommand`, which is what keeps a city reproducible.
 
-import { TICK, ZONES, ZONE_KINDS, ZONE_INDEX, OVERLAYS, REZONE_COST_PER_M2 } from './data.js';
+import { TICK, ZONES, ZONE_KINDS, ZONE_INDEX, OVERLAYS, REZONE_COST_PER_M2, TRANSIT } from './data.js';
 import { encode as encodeShare, CommandLog } from './share.js';
 
 const $ = id => document.getElementById(id);
@@ -74,6 +74,7 @@ export class Game {
     // for the before/after comparison.
     this.baseline = { zone: Uint8Array.from(sim.zone) };
     this.comparing = false;
+    this.drawing = null;      // {kind, stops:[[x,z],…]} while laying a line
 
     this._buildSpeeds();
     this._buildSeaSlider();
@@ -81,6 +82,7 @@ export class Game {
     this._buildZoneButtons();
     this._buildRoadButtons();
     this._buildShare();
+    this._buildTransitButtons();
     this.refreshHud();
     this.refreshRoads();
     this.applyOverlay('none');
@@ -320,6 +322,111 @@ export class Game {
       this.applyOverlay(this._savedOverlay ?? 'none');
     }
     this.view.invalidateShadows();
+  }
+
+
+  // ── transit ──────────────────────────────────────────────────────────────
+
+  _buildTransitButtons() {
+    const row = $('transit-row');
+    if (!row) return;
+    row.innerHTML = '';
+    for (const [key, spec] of Object.entries(TRANSIT.kinds)) {
+      const b = document.createElement('button');
+      b.textContent = `${spec.icon} ${spec.label}`;
+      b.dataset.kind = key;
+      b.title = `${spec.speed} km/h · ${spec.accessMin} min to reach a stop`;
+      b.addEventListener('click', () => this.startLine(key));
+      row.appendChild(b);
+    }
+    const fin = document.createElement('button');
+    fin.textContent = '✓ Finish';
+    fin.addEventListener('click', () => this.finishLine());
+    row.appendChild(fin);
+
+    const clr = document.createElement('button');
+    clr.textContent = '✕ All lines';
+    clr.className = 'danger';
+    clr.title = 'Remove every transit line';
+    clr.addEventListener('click', () => {
+      const r = this.issue({ t: 'transit', op: 'clear' });
+      this.toast(r.ok ? `${r.count} line${r.count === 1 ? '' : 's'} removed` : r.reason, !r.ok);
+      this.afterTransit();
+    });
+    row.appendChild(clr);
+    this.refreshTransit();
+  }
+
+  startLine(kind) {
+    if (this.drawing && this.drawing.kind === kind) { this.cancelLine(); return; }
+    this.drawing = { kind, stops: [] };
+    this.clearSelection();
+    this.refreshTransit();
+    this.toast(`Click along the map to place ${TRANSIT.kinds[kind].label.toLowerCase()} stops, then Finish`);
+  }
+
+  cancelLine() {
+    this.drawing = null;
+    this.view.setDraftLine(null);
+    this.refreshTransit();
+  }
+
+  /** A map click while drawing drops a stop rather than selecting anything. */
+  addStop(x, z) {
+    if (!this.drawing) return false;
+    if (this.drawing.stops.length >= TRANSIT.maxStops) {
+      this.toast(`A line can have at most ${TRANSIT.maxStops} stops`, true);
+      return true;
+    }
+    this.drawing.stops.push([Math.round(x), Math.round(z)]);
+    this.view.setDraftLine(this.drawing);
+    this.refreshTransit();
+    return true;
+  }
+
+  finishLine() {
+    if (!this.drawing) return this.toast('Pick a mode first', true);
+    const { kind, stops } = this.drawing;
+    if (stops.length < TRANSIT.minStops) {
+      return this.toast(`A line needs at least ${TRANSIT.minStops} stops`, true);
+    }
+    const r = this.issue({ t: 'transit', op: 'add', kind, stops });
+    this.drawing = null;
+    this.view.setDraftLine(null);
+    if (!r.ok) { this.refreshTransit(); return this.toast(r.reason, true); }
+    this.toast(`${TRANSIT.kinds[kind].label} line laid — ${r.stops} stops, ${r.km.toFixed(2)} km`);
+    this.afterTransit();
+  }
+
+  afterTransit() {
+    this.view.buildTransit(this.sim.transit);
+    this.refreshHud();
+    this.refreshTransit();
+    this.refreshRoads();
+    this.repaintOverlay(true);
+  }
+
+  refreshTransit() {
+    const row = $('transit-row');
+    if (row) {
+      for (const b of row.children) {
+        if (!b.dataset.kind) continue;
+        b.classList.toggle('drawing', !!this.drawing && this.drawing.kind === b.dataset.kind);
+      }
+    }
+    const info = $('transit-info');
+    if (!info) return;
+    const s = this.sim.stats;
+    if (this.drawing) {
+      const n = this.drawing.stops.length;
+      info.innerHTML = `laying a ${TRANSIT.kinds[this.drawing.kind].label.toLowerCase()} — <b>${n}</b> stop${n === 1 ? '' : 's'} placed ` +
+        `${n >= TRANSIT.minStops ? '· press Finish' : `· ${TRANSIT.minStops - n} more needed`}`;
+    } else if (s.transitLines) {
+      info.innerHTML = `<b>${s.transitLines}</b> line${s.transitLines === 1 ? '' : 's'} · ` +
+        `<b>${s.transitKm.toFixed(1)}</b> km · <b>${(s.transitShare * 100).toFixed(1)}%</b> of trips ride`;
+    } else {
+      info.textContent = 'pick a mode, then click along the map';
+    }
   }
 
   // ── streets ──────────────────────────────────────────────────────────────
